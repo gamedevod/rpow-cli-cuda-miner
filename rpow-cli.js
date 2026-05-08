@@ -983,6 +983,126 @@ async function main() {
     return;
   }
 
+  if (command === "pool-test") {
+    const total = Number(args.challenges || args.count || 10);
+    const engine = args.engine || "cuda";
+    const cudaDevice = Number(args["cuda-device"] || 0);
+    const cudaBatchSize = args["cuda-batch-size"] || 1_073_741_824;
+    const cudaBlocks = args["cuda-blocks"] || null;
+    const logEveryMs = Number(args["log-every-ms"] || 1000);
+    const minerId = ensureMinerId(client, args["miner-id"] || `pool-test-${os.hostname()}`);
+    const mintLogFile = path.resolve(process.cwd(), args["mint-log"] || DEFAULT_MINT_LOG);
+    if (!Number.isInteger(total) || total < 1) throw new Error("--challenges must be a positive integer");
+    if (engine !== "cuda") throw new Error("pool-test currently supports --engine cuda only");
+    if (!Number.isInteger(cudaDevice) || cudaDevice < 0) throw new Error("--cuda-device must be a non-negative integer");
+    if (!Number.isInteger(Number(cudaBatchSize)) || Number(cudaBatchSize) < 1) throw new Error("--cuda-batch-size must be a positive integer");
+    if (cudaBlocks !== null && (!Number.isInteger(Number(cudaBlocks)) || Number(cudaBlocks) < 1)) throw new Error("--cuda-blocks must be a positive integer");
+
+    const account = await client.api("GET", "/me");
+    const batchId = crypto.randomUUID();
+    const challenges = [];
+    const solved = [];
+    const summary = { requested: 0, solved: 0, accepted: 0, mint_failed: 0, solve_failed: 0 };
+    const failures = {};
+    log("info", "pool-test start", {
+      batch_id: batchId,
+      challenges: total,
+      engine,
+      cuda_device: cudaDevice,
+      cuda_batch_size: cudaBatchSize,
+      cuda_blocks: cudaBlocks || "auto",
+      miner_id: minerId,
+    });
+
+    for (let i = 0; i < total; i += 1) {
+      const challenge = await client.api("POST", "/challenge");
+      challenges.push(challenge);
+      summary.requested += 1;
+      log("info", "pool-test challenge", {
+        index: i + 1,
+        total,
+        id: challenge.challenge_id,
+        difficulty: `${challenge.difficulty_bits} bits`,
+        expires: challenge.expires_at,
+      });
+    }
+
+    for (let i = 0; i < challenges.length; i += 1) {
+      const challenge = challenges[i];
+      client.state.mining = { challenge_id: challenge.challenge_id, nonce: "0", hashes: "0", difficulty_bits: challenge.difficulty_bits, engine: "cuda" };
+      client.save();
+      try {
+        log("info", "pool-test solve", { index: i + 1, total, id: challenge.challenge_id });
+        const solution = await mineSolutionCuda(challenge, client.state, client.stateFile, logEveryMs, {
+          device: cudaDevice,
+          batchSize: cudaBatchSize,
+          blocks: cudaBlocks,
+        });
+        solved.push({ challenge, solution });
+        summary.solved += 1;
+        log("info", "pool-test solved", {
+          index: i + 1,
+          total,
+          id: challenge.challenge_id,
+          nonce: solution.solution_nonce,
+          hashes: solution.hashes,
+          speed: solution.speed,
+        });
+      } catch (err) {
+        summary.solve_failed += 1;
+        const key = err.code || String(err.status || "SOLVE_FAILED");
+        failures[key] = (failures[key] || 0) + 1;
+        log("warn", "pool-test solve failed", { id: challenge.challenge_id, error: err.message, code: err.code, status: err.status });
+      }
+    }
+
+    for (let i = 0; i < solved.length; i += 1) {
+      const { challenge, solution } = solved[i];
+      try {
+        log("info", "pool-test mint", { index: i + 1, total: solved.length, id: challenge.challenge_id });
+        const result = await client.api("POST", "/mint", {
+          challenge_id: challenge.challenge_id,
+          solution_nonce: solution.solution_nonce,
+        });
+        summary.accepted += 1;
+        const receipt = buildMintReceipt({
+          minerId,
+          account,
+          challenge,
+          solution,
+          result,
+          engine,
+          workers: 0,
+          engineOptions: {
+            pool_test: true,
+            batch_id: batchId,
+            cuda_device: cudaDevice,
+            cuda_batch_size: String(cudaBatchSize),
+            cuda_blocks: cudaBlocks ? String(cudaBlocks) : "auto",
+          },
+        });
+        appendJsonLine(mintLogFile, receipt);
+        log("success", "pool-test mint accepted", {
+          token_id: receipt.token?.id,
+          challenge_id: receipt.challenge_id,
+          solution_nonce: receipt.solution_nonce,
+          receipt_hash: receipt.receipt_hash,
+        });
+      } catch (err) {
+        summary.mint_failed += 1;
+        const key = err.code || String(err.status || "MINT_FAILED");
+        failures[key] = (failures[key] || 0) + 1;
+        log("warn", "pool-test mint failed", { id: challenge.challenge_id, error: err.message, code: err.code, status: err.status });
+      }
+    }
+
+    client.state.challenge = null;
+    client.state.mining = null;
+    client.save();
+    log("success", "pool-test complete", { ...summary, failures });
+    return;
+  }
+
   if (command === "mine" || command === "run") {
     const target = Number(args.count || args.tokens || 1);
     const workers = Number(args.workers || defaultWorkerCount());
@@ -1099,6 +1219,7 @@ async function main() {
   node rpow-cli.js complete-login --link "https://..."
   node rpow-cli.js cookies --cookie-file .rpow-cookies.txt
   node rpow-cli.js me
+  node rpow-cli.js pool-test --challenges 10 --engine cuda --cuda-device 0
   node rpow-cli.js mine --count 1 --engine native
   node rpow-cli.js run --count 3 --engine native
   node rpow-cli.js send --to user@example.com --amount 1
