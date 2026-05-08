@@ -123,20 +123,68 @@ __device__ void nonce_le(uint64_t nonce, uint8_t out[8]) {
   }
 }
 
+__device__ void set_message_byte(uint32_t words[64], size_t pos, uint8_t value) {
+  words[pos >> 2] |= (uint32_t)value << (24 - (int)((pos & 3) * 8));
+}
+
+__device__ void sha256_oneblock(uint64_t nonce, uint8_t hash[32]) {
+  uint32_t a,b,c,d,e,f,g,h,t1,t2,m[64];
+  for (int i = 0; i < 64; ++i) m[i] = 0;
+
+  for (size_t i = 0; i < c_prefix_len; ++i) set_message_byte(m, i, c_prefix[i]);
+  for (int i = 0; i < 8; ++i) {
+    set_message_byte(m, c_prefix_len + (size_t)i, (uint8_t)(nonce & 0xffu));
+    nonce >>= 8;
+  }
+  const size_t message_len = c_prefix_len + 8;
+  set_message_byte(m, message_len, 0x80);
+  m[15] = (uint32_t)(message_len * 8);
+
+  for (int i = 16; i < 64; ++i) m[i] = SIG1(m[i-2]) + m[i-7] + SIG0(m[i-15]) + m[i-16];
+
+  a=0x6a09e667; b=0xbb67ae85; c=0x3c6ef372; d=0xa54ff53a;
+  e=0x510e527f; f=0x9b05688c; g=0x1f83d9ab; h=0x5be0cd19;
+  for (int i = 0; i < 64; ++i) {
+    t1 = h + EP1(e) + CH(e,f,g) + k[i] + m[i];
+    t2 = EP0(a) + MAJ(a,b,c);
+    h=g; g=f; f=e; e=d+t1; d=c; c=b; b=a; a=t1+t2;
+  }
+
+  uint32_t state[8] = {
+    0x6a09e667 + a, 0xbb67ae85 + b, 0x3c6ef372 + c, 0xa54ff53a + d,
+    0x510e527f + e, 0x9b05688c + f, 0x1f83d9ab + g, 0x5be0cd19 + h
+  };
+  for (int i = 0; i < 4; ++i) {
+    hash[i]      = (state[0] >> (24 - i * 8)) & 0xff;
+    hash[i + 4]  = (state[1] >> (24 - i * 8)) & 0xff;
+    hash[i + 8]  = (state[2] >> (24 - i * 8)) & 0xff;
+    hash[i + 12] = (state[3] >> (24 - i * 8)) & 0xff;
+    hash[i + 16] = (state[4] >> (24 - i * 8)) & 0xff;
+    hash[i + 20] = (state[5] >> (24 - i * 8)) & 0xff;
+    hash[i + 24] = (state[6] >> (24 - i * 8)) & 0xff;
+    hash[i + 28] = (state[7] >> (24 - i * 8)) & 0xff;
+  }
+}
+
 __global__ void mine_kernel(uint64_t start_nonce, uint64_t batch_size, int difficulty, int *found,
                             uint64_t *solution, uint64_t *found_index, uint8_t *solution_hash) {
   uint64_t idx = (uint64_t)blockIdx.x * (uint64_t)blockDim.x + (uint64_t)threadIdx.x;
   if (idx >= batch_size || *found) return;
 
   uint64_t nonce = start_nonce + idx;
-  uint8_t nonce_bytes[8], hash[32];
-  nonce_le(nonce, nonce_bytes);
+  uint8_t hash[32];
 
-  sha256_ctx ctx;
-  sha256_init(&ctx);
-  sha256_update(&ctx, c_prefix, c_prefix_len);
-  sha256_update(&ctx, nonce_bytes, 8);
-  sha256_final(&ctx, hash);
+  if (c_prefix_len + 8 <= 55) {
+    sha256_oneblock(nonce, hash);
+  } else {
+    uint8_t nonce_bytes[8];
+    nonce_le(nonce, nonce_bytes);
+    sha256_ctx ctx;
+    sha256_init(&ctx);
+    sha256_update(&ctx, c_prefix, c_prefix_len);
+    sha256_update(&ctx, nonce_bytes, 8);
+    sha256_final(&ctx, hash);
+  }
 
   if (trailing_zero_bits(hash) >= difficulty) {
     if (atomicCAS(found, 0, 1) == 0) {
