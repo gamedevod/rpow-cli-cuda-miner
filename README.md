@@ -50,6 +50,8 @@ Never commit or publish these files:
 
 ```text
 .rpow-cookies.txt
+.rpow-proxies.txt
+proxies.txt
 .rpow-cli-state.json
 .rpow-mints.jsonl
 *.log
@@ -115,6 +117,42 @@ node rpow-cli.js me \
   --proxy http://127.0.0.1:8080 \
   --cookie-file .rpow-cookies.txt
 ```
+
+Use a rotating proxy list from a local file:
+
+```bash
+nano .rpow-proxies.txt
+```
+
+Put one proxy per line. Supported formats:
+
+```text
+host:port:user:password
+http://user:password@host:port
+https://user:password@host:port
+```
+
+Example conversion:
+
+```text
+residential.byteful.com:8247:USER:PASS
+```
+
+is used as:
+
+```text
+http://USER:PASS@residential.byteful.com:8247
+```
+
+Then run:
+
+```bash
+node rpow-cli.js me \
+  --proxy-file .rpow-proxies.txt \
+  --cookie-file .rpow-cookies.txt
+```
+
+With `--proxy-file`, every API request picks a random proxy from the file. If that request fails and is retried, the next attempt picks another random proxy when more than one proxy is available. Proxy values are not printed; only the number of loaded proxies is logged.
 
 Environment variables are also supported:
 
@@ -224,6 +262,7 @@ node rpow-cli.js pool \
   --cuda-batch-size 1073741824 \
   --pool-timeout 0 \
   --api-retry-delay-ms 500 \
+  --proxy-file .rpow-proxies.txt \
   --stats-every-ms 5000 \
   --miner-id pool-8x5090 \
   --cookie-file .rpow-cookies.txt > pool.log 2>&1 &

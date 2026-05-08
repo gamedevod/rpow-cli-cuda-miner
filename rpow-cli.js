@@ -154,11 +154,39 @@ function shouldBypassProxy(url, noProxyValue) {
     });
 }
 
-function createFetchRuntime(proxyUrl) {
-  if (!proxyUrl) return { fetchImpl: globalThis.fetch, dispatcher: null, proxy: null };
-  if (proxyUrl === true || typeof proxyUrl !== "string") {
-    throw new Error("--proxy requires a proxy URL, for example: --proxy http://127.0.0.1:8080");
+function normalizeProxyLine(line) {
+  const value = String(line).trim();
+  if (!value || value.startsWith("#")) return null;
+  if (/^https?:\/\//i.test(value)) return value;
+  const first = value.indexOf(":");
+  const second = first >= 0 ? value.indexOf(":", first + 1) : -1;
+  const third = second >= 0 ? value.indexOf(":", second + 1) : -1;
+  if (first <= 0 || second <= first || third <= second) {
+    throw new Error("bad proxy line; expected host:port:user:password or http://user:password@host:port");
   }
+  const host = value.slice(0, first);
+  const port = value.slice(first + 1, second);
+  const user = value.slice(second + 1, third);
+  const password = value.slice(third + 1);
+  return `http://${encodeURIComponent(user)}:${encodeURIComponent(password)}@${host}:${port}`;
+}
+
+function loadProxyFile(proxyFile) {
+  if (!proxyFile) return [];
+  if (proxyFile === true || typeof proxyFile !== "string") {
+    throw new Error("--proxy-file requires a local file path");
+  }
+  const file = path.resolve(process.cwd(), proxyFile);
+  const proxies = fs.readFileSync(file, "utf8")
+    .split(/\r?\n/)
+    .map(normalizeProxyLine)
+    .filter(Boolean);
+  if (proxies.length === 0) throw new Error(`proxy file has no usable proxies: ${proxyFile}`);
+  log("success", "proxies loaded", { count: proxies.length });
+  return proxies;
+}
+
+function loadUndiciForProxy() {
   let undici;
   try {
     undici = require("undici");
@@ -170,8 +198,41 @@ function createFetchRuntime(proxyUrl) {
   if (typeof undici.fetch !== "function" || typeof undici.ProxyAgent !== "function") {
     throw new Error("installed undici package does not expose fetch and ProxyAgent");
   }
-  const dispatcher = new undici.ProxyAgent(proxyUrl);
-  return { fetchImpl: undici.fetch, dispatcher, proxy: proxyUrl };
+  return undici;
+}
+
+function createFetchRuntime(proxyUrl, proxyFile) {
+  const proxyList = loadProxyFile(proxyFile);
+  if (!proxyUrl && proxyList.length === 0) {
+    return { fetchImpl: globalThis.fetch, ProxyAgent: null, proxy: null, proxyList: [], dispatcherCache: new Map() };
+  }
+  if (proxyUrl === true || (proxyUrl && typeof proxyUrl !== "string")) {
+    throw new Error("--proxy requires a proxy URL, for example: --proxy http://127.0.0.1:8080");
+  }
+  const undici = loadUndiciForProxy();
+  const proxy = proxyUrl ? normalizeProxyLine(proxyUrl) : null;
+  const proxies = proxyList.length ? proxyList : (proxy ? [proxy] : []);
+  const dispatcherCache = new Map();
+  if (proxies.length === 1) dispatcherCache.set(proxies[0], new undici.ProxyAgent(proxies[0]));
+  return { fetchImpl: undici.fetch, ProxyAgent: undici.ProxyAgent, proxy, proxyList: proxies, dispatcherCache };
+}
+
+function randomChoice(items) {
+  return items[Math.floor(Math.random() * items.length)];
+}
+
+function getProxyDispatcher(client, url, avoidProxyUrl = null) {
+  if (!client.proxyList.length || shouldBypassProxy(url, client.noProxy)) return null;
+  const choices = avoidProxyUrl && client.proxyList.length > 1
+    ? client.proxyList.filter((proxyUrl) => proxyUrl !== avoidProxyUrl)
+    : client.proxyList;
+  const proxyUrl = randomChoice(choices);
+  let dispatcher = client.dispatcherCache.get(proxyUrl);
+  if (!dispatcher) {
+    dispatcher = new client.ProxyAgent(proxyUrl);
+    client.dispatcherCache.set(proxyUrl, dispatcher);
+  }
+  return { dispatcher, proxyUrl };
 }
 
 function isTransientNetworkError(err) {
@@ -349,9 +410,11 @@ class RpowClient {
     this.retryDelayMs = options.retryDelayMs === undefined ? 2000 : Number(options.retryDelayMs);
     this.noProxy = options.noProxy || process.env.NO_PROXY || process.env.no_proxy || "";
     const proxyUrl = options.proxy || proxyEnv();
-    const runtime = createFetchRuntime(proxyUrl);
+    const runtime = createFetchRuntime(proxyUrl, options.proxyFile);
     this.fetchImpl = runtime.fetchImpl;
-    this.dispatcher = runtime.dispatcher;
+    this.ProxyAgent = runtime.ProxyAgent;
+    this.proxyList = runtime.proxyList;
+    this.dispatcherCache = runtime.dispatcherCache;
     this.proxy = runtime.proxy;
   }
 
@@ -363,11 +426,13 @@ class RpowClient {
   async request(method, urlOrPath, body, options = {}) {
     const url = assertSafeUrl(urlOrPath, this.apiOrigin);
     let attempt = 0;
+    let avoidProxyUrl = options.avoidProxy || null;
     while (true) {
       attempt += 1;
       const controller = this.timeoutMs > 0 ? new AbortController() : null;
       const timeout = controller ? setTimeout(() => controller.abort(), this.timeoutMs) : null;
       const started = Date.now();
+      let selectedProxyUrl = null;
       try {
         const headers = {
           "accept": "application/json, text/plain, */*",
@@ -382,7 +447,9 @@ class RpowClient {
           headers["content-type"] = "application/json";
           payload = JSON.stringify(body);
         }
-        const useProxy = this.dispatcher && !shouldBypassProxy(url, this.noProxy);
+        const proxySelection = getProxyDispatcher(this, url, avoidProxyUrl);
+        const useProxy = Boolean(proxySelection);
+        selectedProxyUrl = proxySelection?.proxyUrl || null;
         debugLog("HTTP ->", {
           method,
           url: safeUrlForLog(url),
@@ -397,7 +464,7 @@ class RpowClient {
           body: payload,
           redirect: options.redirect || "manual",
           ...(controller ? { signal: controller.signal } : {}),
-          ...(useProxy ? { dispatcher: this.dispatcher } : {}),
+          ...(proxySelection ? { dispatcher: proxySelection.dispatcher } : {}),
         });
         storeSetCookies(this.state, responseSetCookies(res.headers));
         this.save();
@@ -432,6 +499,10 @@ class RpowClient {
         }
         return { res, data: parsed ?? text };
       } catch (err) {
+        if (selectedProxyUrl) {
+          err.proxyKey = selectedProxyUrl;
+          avoidProxyUrl = selectedProxyUrl;
+        }
         if (isAuthRequest(method, url) && looksLikeProviderRateLimit(err)) {
           const waitSeconds = Math.ceil((err.cooldownMs || 60000) / 1000);
           const e = new Error(`magic-link request is rate-limited; wait at least ${waitSeconds}s before running login again`);
@@ -1200,6 +1271,7 @@ async function main() {
     retries: args.retries || 5,
     retryDelayMs: args["retry-delay-ms"] || 2000,
     proxy: args.proxy,
+    proxyFile: args["proxy-file"],
     noProxy: args["no-proxy"],
   });
 
@@ -1329,11 +1401,13 @@ async function main() {
 
     async function apiForever(kind, method, pathName, body) {
       let attempts = 0;
+      let avoidProxy = null;
       while (!stopRequested) {
         attempts += 1;
         try {
-          return await client.api(method, pathName, body);
+          return await client.api(method, pathName, body, { avoidProxy });
         } catch (err) {
+          if (err.proxyKey) avoidProxy = err.proxyKey;
           if (err.code === "UNAUTHORIZED") throw err;
           if (err.status && err.status >= 400 && err.status < 500 && err.status !== 408 && err.status !== 425 && err.status !== 429) {
             throw err;
@@ -1845,6 +1919,7 @@ Options:
   --retries 5
   --retry-delay-ms 2000
   --proxy http://127.0.0.1:8080
+  --proxy-file .rpow-proxies.txt
   --no-proxy localhost,127.0.0.1
   --log-every-ms 5000
   --workers ${defaultWorkerCount()}

@@ -2,6 +2,8 @@
 .rpow-cli-state.*.json
 .rpow-cli-state.json.*.tmp
 .rpow-cookies.txt
+.rpow-proxies.txt
+proxies.txt
 .rpow-mints.jsonl
 .env
 *.log
