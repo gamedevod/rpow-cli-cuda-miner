@@ -867,7 +867,7 @@ function mineSolutionCuda(challenge, state, stateFile, logEveryMs, options) {
             cuda_batch_size: batchSize,
             cuda_blocks: blocks || "auto",
           };
-          saveState(stateFile, state);
+          if (stateFile) saveState(stateFile, state);
           resolve({
             solution_nonce: message.solution_nonce,
             hashes: message.hashes,
