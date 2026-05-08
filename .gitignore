@@ -1,9 +1,13 @@
 .rpow-cli-state.json
 .rpow-cli-state.*.json
 .rpow-cli-state.json.*.tmp
+.rpow-cookies.txt
+.rpow-mints.jsonl
 .env
 *.log
 rpow-native-miner
 rpow-native-miner.exe
+rpow-cuda-miner
+rpow-cuda-miner.exe
 node_modules/
 .DS_Store

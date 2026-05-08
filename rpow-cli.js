@@ -13,6 +13,7 @@ const DEFAULT_SITE_ORIGIN = "https://rpow2.com";
 const DEFAULT_API_ORIGIN = "https://api.rpow2.com";
 const DEFAULT_INDEX = path.join(__dirname, "index.js");
 const DEFAULT_STATE = path.join(__dirname, ".rpow-cli-state.json");
+const DEFAULT_MINT_LOG = path.join(__dirname, ".rpow-mints.jsonl");
 const MINER_WORKER = path.join(__dirname, "rpow-miner-worker.js");
 const NATIVE_MINER_CANDIDATES = process.platform === "win32"
   ? [
@@ -22,6 +23,15 @@ const NATIVE_MINER_CANDIDATES = process.platform === "win32"
   : [
     path.join(__dirname, "rpow-native-miner"),
     path.join(__dirname, "rpow-native-miner.exe"),
+  ];
+const CUDA_MINER_CANDIDATES = process.platform === "win32"
+  ? [
+    path.join(__dirname, "rpow-cuda-miner.exe"),
+    path.join(__dirname, "rpow-cuda-miner"),
+  ]
+  : [
+    path.join(__dirname, "rpow-cuda-miner"),
+    path.join(__dirname, "rpow-cuda-miner.exe"),
   ];
 const SAFE_HOSTS = new Set([
   "api.rpow2.com",
@@ -153,6 +163,28 @@ function saveState(file, state) {
   fs.renameSync(tmp, file);
 }
 
+function appendJsonLine(file, value) {
+  fs.appendFileSync(file, `${JSON.stringify(value)}\n`, { mode: 0o600 });
+  try {
+    fs.chmodSync(file, 0o600);
+  } catch {
+    // Best effort: Windows and some filesystems may not support chmod.
+  }
+}
+
+function ensureMinerId(client, requestedMinerId) {
+  if (requestedMinerId) {
+    client.state.miner_id = String(requestedMinerId);
+    client.save();
+    return client.state.miner_id;
+  }
+  if (!client.state.miner_id) {
+    client.state.miner_id = crypto.randomUUID();
+    client.save();
+  }
+  return client.state.miner_id;
+}
+
 function discoverFromIndex(indexFile) {
   const js = fs.readFileSync(indexFile, "utf8");
   const apiOrigin = /const\s+\w+\s*=\s*"([^"]+)";\s*async function\s+\w+\(\w+,\s*\w+,\s*\w+\)/.exec(js)?.[1]
@@ -171,7 +203,7 @@ function printApiMap(discovered) {
   console.log("2. Open/fetch magic link -> server sets session cookie; CLI stores Set-Cookie values.");
   console.log("3. GET /me -> verifies session and balance.");
   console.log("4. POST /challenge -> { challenge_id, nonce_prefix, difficulty_bits }.");
-  console.log("5. Mine locally with the native C miner: SHA-256(nonce_prefix || uint64-le nonce), accept trailing zero bits >= difficulty_bits.");
+  console.log("5. Mine locally with node, native C, or CUDA: SHA-256(nonce_prefix || uint64-le nonce), accept trailing zero bits >= difficulty_bits.");
   console.log("6. POST /mint { challenge_id, solution_nonce } -> mints/claims token.");
   console.log("7. Repeat from /challenge for more tokens; no separate commit/reveal endpoint is used by this site.");
   console.log("Endpoints found in index.js:");
@@ -188,6 +220,44 @@ function assertSafeUrl(rawUrl, apiOrigin) {
 
 function cookieHeader(cookies = {}) {
   return Object.entries(cookies).map(([k, v]) => `${k}=${v}`).join("; ");
+}
+
+function parseCookieHeader(header) {
+  let trimmed = header.trim();
+  if (!trimmed) throw new Error("cookie file is empty");
+  if (/[\r\n]/.test(trimmed)) throw new Error("cookie file must contain a single Cookie header line");
+  const curlHeader = /^(?:-H|--header)\s+(['"]?)(cookie:\s*.+)\1$/i.exec(trimmed);
+  if (curlHeader) trimmed = curlHeader[2];
+  trimmed = trimmed.replace(/^cookie:\s*/i, "");
+
+  const cookies = {};
+  for (const part of trimmed.split(";")) {
+    const pair = part.trim();
+    if (!pair) continue;
+    const eq = pair.indexOf("=");
+    if (eq <= 0) throw new Error("cookie file must contain a Cookie header, not Set-Cookie attributes");
+    const name = pair.slice(0, eq).trim();
+    const value = pair.slice(eq + 1).trim();
+    if (/^(domain|path|expires|max-age|samesite|secure|httponly)$/i.test(name)) {
+      throw new Error("cookie file must contain a Cookie header, not Set-Cookie attributes");
+    }
+    if (!name) throw new Error("cookie file contains a cookie without a name");
+    cookies[name] = value;
+  }
+  if (Object.keys(cookies).length === 0) throw new Error("cookie file does not contain any cookies");
+  if (cookies.name === "value" && cookies.another === "value") {
+    throw new Error("cookie file still contains the example placeholder; replace it with your real Cookie header");
+  }
+  return cookies;
+}
+
+function importCookieFile(client, cookieFile) {
+  const file = path.resolve(process.cwd(), cookieFile);
+  const cookies = parseCookieHeader(fs.readFileSync(file, "utf8"));
+  client.state.cookies = cookies;
+  client.state.cookies_imported_at = new Date().toISOString();
+  client.save();
+  log("success", "cookies imported", { count: Object.keys(cookies).length });
 }
 
 function storeSetCookies(state, setCookieHeaders) {
@@ -376,12 +446,52 @@ function trailingZeroBits(buf) {
   return bits;
 }
 
+function solutionDigestHex(challenge, nonce) {
+  return crypto.createHash("sha256")
+    .update(hexToBytes(challenge.nonce_prefix))
+    .update(nonceLe64(BigInt(nonce)))
+    .digest("hex");
+}
+
+function buildMintReceipt({ minerId, account, challenge, solution, result, engine, workers, engineOptions = {} }) {
+  const digest = solutionDigestHex(challenge, solution.solution_nonce);
+  const receipt = {
+    version: 1,
+    accepted_at: new Date().toISOString(),
+    miner_id: minerId,
+    host: os.hostname(),
+    pid: process.pid,
+    account_email: account?.email || null,
+    engine,
+    workers,
+    engine_options: engineOptions,
+    challenge_id: challenge.challenge_id,
+    nonce_prefix: challenge.nonce_prefix,
+    difficulty_bits: challenge.difficulty_bits,
+    solution_nonce: solution.solution_nonce,
+    solution_digest: digest,
+    verified_trailing_zero_bits: trailingZeroBits(Buffer.from(digest, "hex")),
+    hashes: solution.hashes,
+    speed: solution.speed,
+    elapsed_ms: solution.elapsed_ms,
+    token: result?.token || result,
+  };
+  receipt.receipt_hash = crypto.createHash("sha256")
+    .update(JSON.stringify(receipt))
+    .digest("hex");
+  return receipt;
+}
+
 function defaultWorkerCount() {
   return Math.max(1, Math.min(os.cpus().length - 1, os.cpus().length, 8));
 }
 
 function nativeMinerPath() {
   return NATIVE_MINER_CANDIDATES.find((file) => fs.existsSync(file)) || null;
+}
+
+function cudaMinerPath() {
+  return CUDA_MINER_CANDIDATES.find((file) => fs.existsSync(file)) || null;
 }
 
 function mineSolutionSingleThread(challenge, state, stateFile, logEveryMs) {
@@ -662,6 +772,115 @@ function mineSolutionNative(challenge, state, stateFile, logEveryMs, workerCount
   });
 }
 
+function mineSolutionCuda(challenge, state, stateFile, logEveryMs, options) {
+  const cudaMiner = cudaMinerPath();
+  if (!cudaMiner) {
+    throw new Error(`CUDA miner not built; expected one of: ${CUDA_MINER_CANDIDATES.join(", ")}`);
+  }
+  return new Promise((resolve, reject) => {
+    const difficulty = Number(challenge.difficulty_bits);
+    const expiresAt = challenge.expires_at ? Date.parse(challenge.expires_at) : null;
+    const cutoffAt = Number.isFinite(expiresAt) ? expiresAt - 5000 : 0;
+    const startNonce = BigInt(state.mining?.nonce || "0");
+    const device = Number(options.device || 0);
+    const batchSize = String(options.batchSize || 67_108_864);
+    const started = Date.now();
+    let settled = false;
+    let stderr = "";
+
+    const child = spawn(cudaMiner, [
+      "--prefix", challenge.nonce_prefix,
+      "--difficulty", String(difficulty),
+      "--device", String(device),
+      "--batch-size", batchSize,
+      "--start", startNonce.toString(),
+      "--cutoff-ms", String(cutoffAt || 0),
+      "--progress-ms", String(logEveryMs),
+    ], { windowsHide: true });
+
+    let buffer = "";
+    child.stdout.on("data", (chunk) => {
+      buffer += chunk.toString("utf8");
+      while (buffer.includes("\n")) {
+        const idx = buffer.indexOf("\n");
+        const line = buffer.slice(0, idx).trim();
+        buffer = buffer.slice(idx + 1);
+        if (!line) continue;
+        let message;
+        try {
+          message = JSON.parse(line);
+        } catch {
+          log("warn", "CUDA miner emitted non-json line", { line });
+          continue;
+        }
+        if (message.type === "progress") {
+          const hashes = BigInt(message.hashes || "0");
+          const seconds = Math.max(1, (Date.now() - started) / 1000);
+          const rate = Number(hashes) / seconds;
+          state.mining = {
+            challenge_id: challenge.challenge_id,
+            nonce: message.nonce,
+            hashes: hashes.toString(),
+            difficulty_bits: difficulty,
+            engine: "cuda",
+            cuda_device: device,
+            cuda_batch_size: batchSize,
+          };
+          saveState(stateFile, state);
+          log("info", "mining", {
+            hashes: hashes.toString(),
+            nonce: message.nonce,
+            device,
+            engine: "cuda",
+            speed: `${(rate / 1_000_000).toFixed(2)} MH/s`,
+          });
+        }
+        if (message.type === "found") {
+          settled = true;
+          const hashes = BigInt(message.hashes || "0");
+          const seconds = Math.max(0.001, (Date.now() - started) / 1000);
+          const rate = Number(hashes) / seconds;
+          state.mining = {
+            ...state.mining,
+            nonce: message.solution_nonce,
+            hashes: message.hashes,
+            found_at: new Date().toISOString(),
+            engine: "cuda",
+            cuda_device: device,
+            cuda_batch_size: batchSize,
+          };
+          saveState(stateFile, state);
+          resolve({
+            solution_nonce: message.solution_nonce,
+            hashes: message.hashes,
+            digest: message.digest,
+            speed: `${(rate / 1_000_000).toFixed(2)} MH/s`,
+            elapsed_ms: Date.now() - started,
+          });
+        }
+        if (message.type === "expired") {
+          settled = true;
+          const err = new Error("challenge expired before a solution was found");
+          err.code = "CHALLENGE_EXPIRED";
+          err.retryable = true;
+          reject(err);
+        }
+      }
+    });
+
+    child.stderr.on("data", (chunk) => {
+      stderr += chunk.toString("utf8");
+    });
+
+    child.on("error", reject);
+    child.on("exit", (code) => {
+      if (settled) return;
+      if (code === 0) return;
+      reject(new Error(`CUDA miner exited with code ${code}${stderr ? `: ${stderr.trim()}` : ""}`));
+    });
+  });
+}
+
 async function promptLine(label) {
   const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
   return new Promise((resolve) => rl.question(label, (answer) => {
@@ -682,6 +901,8 @@ async function main() {
     timeoutMs: args.timeout || 20000,
     retries: args.retries || 5,
   });
+
+  if (args["cookie-file"]) importCookieFile(client, args["cookie-file"]);
 
   if (command === "map") {
     printApiMap(discovered);
@@ -741,11 +962,18 @@ async function main() {
     const target = Number(args.count || args.tokens || 1);
     const workers = Number(args.workers || defaultWorkerCount());
     const engine = args.engine || (nativeMinerPath() ? "native" : "node");
-    const logEveryMs = Number(args["log-every-ms"] || (engine === "native" ? 1000 : 5000));
+    const logEveryMs = Number(args["log-every-ms"] || (["native", "cuda"].includes(engine) ? 1000 : 5000));
+    const minerId = ensureMinerId(client, args["miner-id"]);
+    const mintLogFile = path.resolve(process.cwd(), args["mint-log"] || DEFAULT_MINT_LOG);
+    const cudaDevice = Number(args["cuda-device"] || 0);
+    const cudaBatchSize = args["cuda-batch-size"] || 67_108_864;
     if (!Number.isInteger(workers) || workers < 1) throw new Error("--workers must be a positive integer");
-    if (!["native", "node"].includes(engine)) throw new Error("--engine must be native or node");
+    if (!["native", "node", "cuda"].includes(engine)) throw new Error("--engine must be native, node, or cuda");
+    if (engine === "cuda" && (!Number.isInteger(cudaDevice) || cudaDevice < 0)) throw new Error("--cuda-device must be a non-negative integer");
+    if (engine === "cuda" && (!Number.isInteger(Number(cudaBatchSize)) || Number(cudaBatchSize) < 1)) throw new Error("--cuda-batch-size must be a positive integer");
     let minted = 0;
-    await client.api("GET", "/me");
+    const account = await client.api("GET", "/me");
+    log("info", "miner identity", { miner_id: minerId, mint_log: mintLogFile });
     while (minted < target) {
       let challenge = client.state.challenge;
       const challengeExpiresAt = challenge?.expires_at ? Date.parse(challenge.expires_at) : null;
@@ -764,10 +992,17 @@ async function main() {
       });
       let solution;
       try {
-        log("info", "miner config", { workers, engine });
-        solution = engine === "native"
-          ? await mineSolutionNative(challenge, client.state, client.stateFile, logEveryMs, workers)
-          : await mineSolutionParallel(challenge, client.state, client.stateFile, logEveryMs, workers);
+        log("info", "miner config", {
+          workers: engine === "cuda" ? undefined : workers,
+          engine,
+          cuda_device: engine === "cuda" ? cudaDevice : undefined,
+          cuda_batch_size: engine === "cuda" ? cudaBatchSize : undefined,
+        });
+        solution = engine === "cuda"
+          ? await mineSolutionCuda(challenge, client.state, client.stateFile, logEveryMs, { device: cudaDevice, batchSize: cudaBatchSize })
+          : engine === "native"
+            ? await mineSolutionNative(challenge, client.state, client.stateFile, logEveryMs, workers)
+            : await mineSolutionParallel(challenge, client.state, client.stateFile, logEveryMs, workers);
       } catch (err) {
         if (err.code === "CHALLENGE_EXPIRED") {
           log("warn", "challenge expired during mining; requesting a fresh one");
@@ -790,11 +1025,30 @@ async function main() {
           solution_nonce: solution.solution_nonce,
         });
         minted += 1;
+        const receipt = buildMintReceipt({
+          minerId,
+          account,
+          challenge,
+          solution,
+          result,
+          engine,
+          workers,
+          engineOptions: engine === "cuda" ? { cuda_device: cudaDevice, cuda_batch_size: String(cudaBatchSize) } : {},
+        });
+        appendJsonLine(mintLogFile, receipt);
         client.state.last_mint = result;
+        client.state.last_mint_receipt_hash = receipt.receipt_hash;
         client.state.challenge = null;
         client.state.mining = null;
         client.save();
-        log("success", "mint/claim accepted", result);
+        log("success", "mint/claim accepted", {
+          token_id: receipt.token?.id,
+          miner_id: receipt.miner_id,
+          challenge_id: receipt.challenge_id,
+          solution_nonce: receipt.solution_nonce,
+          receipt_hash: receipt.receipt_hash,
+          mint_log: mintLogFile,
+        });
         log("success", "mint progress", { minted, target, remaining: Math.max(0, target - minted) });
       } catch (err) {
         if (err.code === "UNAUTHORIZED") {
@@ -825,11 +1079,14 @@ async function main() {
 
 Options:
   --state .rpow-cli-state.json
+  --cookie-file .rpow-cookies.txt
   --timeout 20000
   --retries 5
   --log-every-ms 5000
   --workers ${defaultWorkerCount()}
-  --engine native|node  (native C miner recommended)
+  --engine native|node|cuda  (native C miner recommended; cuda for NVIDIA GPUs)
+  --cuda-device 0
+  --cuda-batch-size 67108864
   --verbose`);
 }
 

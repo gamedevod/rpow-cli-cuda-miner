@@ -19,8 +19,10 @@ This is an unofficial tool. Use it only with your own account and follow the ser
 
 ```text
 rpow-native-miner.c      Native C miner source, buildable with gcc/clang.
+rpow-cuda-miner.cu       CUDA miner source for NVIDIA GPUs.
 build-native.ps1         Windows helper script for building rpow-native-miner.exe.
 build-native.sh          macOS/Linux helper script for building rpow-native-miner.
+build-cuda.sh            Linux helper script for building rpow-cuda-miner with nvcc.
 rpow-cli.js              Node.js CLI wrapper for login, API requests and miner orchestration.
 rpow-miner-worker.js     Slower JavaScript fallback miner used only with `--engine node`.
 index.js                 Frontend bundle used for API discovery by `map`.
@@ -37,6 +39,7 @@ Runtime state is stored in `.rpow-cli-state.json`. It contains account email, co
   - Windows output name: `rpow-native-miner.exe`.
   - Linux/macOS output name: `rpow-native-miner`.
 - Optional: gcc/clang if you want to rebuild the native C miner yourself.
+- Optional for NVIDIA GPU mining: NVIDIA driver, `nvidia-smi`, and CUDA Toolkit 12.8+ or CUDA 13.x. Blackwell/B200 GPUs require a Toolkit new enough to compile `sm_100`.
 
 Check Node.js:
 
@@ -72,6 +75,36 @@ If the native C miner is unavailable, use the slower JavaScript fallback:
 
 ```powershell
 node rpow-cli.js mine --count 1 --workers 8 --engine node
+```
+
+On a CUDA server, build the GPU miner and run:
+
+```bash
+./build-cuda.sh
+./rpow-cuda-miner --self-test --device 0
+node rpow-cli.js mine --count 1 --engine cuda --cuda-device 0
+```
+
+## Login With an Existing Cookie Header
+
+You can import an existing browser session from a local file instead of using the magic-link flow. Create `.rpow-cookies.txt` in the repository folder and put one Cookie header line in it:
+
+```text
+name=value; another=value
+```
+
+Do not commit or share this file. It is ignored by `.gitignore`.
+
+Verify the session:
+
+```bash
+node rpow-cli.js me --cookie-file .rpow-cookies.txt
+```
+
+Mine one token with the native engine:
+
+```bash
+node rpow-cli.js mine --count 1 --workers 8 --engine native --cookie-file .rpow-cookies.txt
 ```
 
 ## Native C Setup for Beginners
@@ -158,6 +191,52 @@ node rpow-cli.js mine --count 1 --workers 8 --engine native
 ```
 
 The CLI looks for `rpow-native-miner.exe` on Windows and `rpow-native-miner` on macOS/Linux. If no native binary exists, `--engine native` will fail and tell you to build the native miner.
+
+### NVIDIA CUDA Setup
+
+CUDA mining keeps the same CLI pipeline: session cookies or magic-link login, `POST /challenge`, local GPU proof-of-work, and `POST /mint`.
+
+Check the server:
+
+```bash
+nvidia-smi
+nvidia-smi --query-gpu=name,compute_cap --format=csv
+nvcc --version
+uname -a
+```
+
+For NVIDIA B200/Blackwell, install CUDA Toolkit 12.8+ or CUDA 13.x before building. `build-cuda.sh` stops if `nvcc` is missing or too old. It detects the first GPU compute capability and builds with matching SASS plus PTX fallback. For compute capability `10.0`, it uses `sm_100`.
+
+Build:
+
+```bash
+chmod +x build-cuda.sh
+./build-cuda.sh
+```
+
+If the server cannot run `nvidia-smi` during build but you know the target capability, pass it explicitly:
+
+```bash
+CUDA_COMPUTE_CAP=10.0 ./build-cuda.sh
+```
+
+Quick CUDA self-test:
+
+```bash
+./rpow-cuda-miner --self-test --device 0
+```
+
+Run one mint on GPU:
+
+```bash
+node rpow-cli.js mine --count 1 --engine cuda --cuda-device 0 --cookie-file .rpow-cookies.txt
+```
+
+Tune batch size if progress updates are too slow or kernel launches are too frequent:
+
+```bash
+node rpow-cli.js mine --count 1 --engine cuda --cuda-device 0 --cuda-batch-size 67108864 --cookie-file .rpow-cookies.txt
+```
 
 ## Commands
 
@@ -253,6 +332,14 @@ Path to the state file. Default: `.rpow-cli-state.json`.
 node rpow-cli.js mine --state .my-rpow-state.json
 ```
 
+### `--cookie-file`
+
+Imports cookies from a local file containing one Cookie header line, saves them into `.rpow-cli-state.json`, and uses them for authenticated commands.
+
+```powershell
+node rpow-cli.js me --cookie-file .rpow-cookies.txt
+```
+
 ### `--timeout`
 
 HTTP request timeout in milliseconds. Default: `20000`.
@@ -277,6 +364,22 @@ How often mining progress is logged and nonce progress is saved. Default: `5000`
 node rpow-cli.js mine --log-every-ms 2000
 ```
 
+### `--miner-id`
+
+Sets a local miner identity stored in `.rpow-cli-state.json` and written into every successful mint receipt. Use different names when multiple miners share one account.
+
+```powershell
+node rpow-cli.js mine --miner-id macbook-pro --engine native
+```
+
+### `--mint-log`
+
+Path to the successful mint receipt log. Default: `.rpow-mints.jsonl`. Each accepted mint appends one JSON line with the miner id, token id, challenge id, solution nonce, verified SHA-256 digest and a `receipt_hash`.
+
+```powershell
+node rpow-cli.js mine --mint-log .rpow-mints.jsonl
+```
+
 ### `--workers`
 
 Number of CPU worker threads. By default the CLI uses up to 8 workers while leaving one logical CPU for the system.
@@ -293,11 +396,28 @@ node rpow-cli.js mine --workers 4
 
 ### `--engine`
 
-Mining engine: `native` or `node`. `native` is the recommended engine. If `rpow-native-miner.exe` is present, the CLI uses `native` by default.
+Mining engine: `native`, `node`, or `cuda`. `native` is the recommended CPU engine. `cuda` uses `rpow-cuda-miner` on NVIDIA GPUs.
 
 ```powershell
 node rpow-cli.js mine --engine native --workers 8
 node rpow-cli.js mine --engine node --workers 8
+node rpow-cli.js mine --engine cuda --cuda-device 0
+```
+
+### `--cuda-device`
+
+CUDA device index for `--engine cuda`. Default: `0`.
+
+```powershell
+node rpow-cli.js mine --engine cuda --cuda-device 0
+```
+
+### `--cuda-batch-size`
+
+Number of nonces tested per CUDA kernel launch. Default: `67108864`.
+
+```powershell
+node rpow-cli.js mine --engine cuda --cuda-batch-size 67108864
 ```
 
 ### `--fresh`
@@ -346,6 +466,13 @@ Linux/macOS:
 ./build-native.sh
 ```
 
+CUDA Linux server:
+
+```bash
+./build-cuda.sh
+./rpow-cuda-miner --self-test --device 0
+```
+
 The JavaScript engine exists only as a slower fallback for systems without a compiled miner.
 
 ## Logs and Privacy
@@ -364,6 +491,14 @@ Mining progress logs look like this:
 ```text
 mining hashes=... nonce=... workers=8 engine=native speed="21.00 MH/s"
 ```
+
+Successful mints are also appended to `.rpow-mints.jsonl` as local proof receipts. When multiple miners use the same account, give each miner a distinct id:
+
+```bash
+node rpow-cli.js mine --count 1000000 --workers 8 --engine native --miner-id macbook-pro --cookie-file .rpow-cookies.txt
+```
+
+The terminal success line includes `miner_id`, `token_id`, `challenge_id`, `solution_nonce` and `receipt_hash`. The JSONL receipt contains the full proof data without cookies.
 
 ## Retry and Resume Behavior
 
