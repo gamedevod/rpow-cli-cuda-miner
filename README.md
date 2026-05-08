@@ -356,6 +356,14 @@ Number of retries for transient failures: timeout, `429`, `408`, `425`, `5xx`. D
 node rpow-cli.js mine --retries 8
 ```
 
+### `--retry-delay-ms`
+
+Fixed delay between transient request retries. Default: `2000`.
+
+```powershell
+node rpow-cli.js mine --timeout 60000 --retry-delay-ms 2000
+```
+
 ### `--log-every-ms`
 
 How often mining progress is logged and nonce progress is saved. Default: `5000`.

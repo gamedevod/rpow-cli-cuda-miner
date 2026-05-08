@@ -302,6 +302,7 @@ class RpowClient {
     this.state = loadState(this.stateFile);
     this.timeoutMs = Number(options.timeoutMs || 20000);
     this.maxRetries = Number(options.retries || 5);
+    this.retryDelayMs = Number(options.retryDelayMs || 2000);
   }
 
   save() {
@@ -387,8 +388,7 @@ class RpowClient {
         }
         const retryable = err.retryable || isTransientNetworkError(err);
         if (!retryable || attempt > this.maxRetries) throw err;
-        const backoff = Math.min(30000, 500 * 2 ** (attempt - 1)) + Math.floor(Math.random() * 250);
-        const delay = Math.max(backoff, Math.min(err.retryAfterMs || 0, 60000));
+        const delay = Math.max(this.retryDelayMs, Math.min(err.retryAfterMs || 0, 60000));
         log("warn", `request failed, retrying in ${delay}ms`, {
           method,
           url: safeUrlForLog(url),
@@ -914,6 +914,7 @@ async function main() {
     stateFile: args.state || DEFAULT_STATE,
     timeoutMs: args.timeout || 20000,
     retries: args.retries || 5,
+    retryDelayMs: args["retry-delay-ms"] || 2000,
   });
 
   if (args["cookie-file"]) importCookieFile(client, args["cookie-file"]);
@@ -1103,6 +1104,7 @@ Options:
   --cookie-file .rpow-cookies.txt
   --timeout 20000
   --retries 5
+  --retry-delay-ms 2000
   --log-every-ms 5000
   --workers ${defaultWorkerCount()}
   --engine native|node|cuda  (native C miner recommended; cuda for NVIDIA GPUs)
