@@ -798,6 +798,7 @@ function mineSolutionCuda(challenge, state, stateFile, logEveryMs, options) {
     const startNonce = BigInt(state.mining?.nonce || "0");
     const device = Number(options.device || 0);
     const batchSize = String(options.batchSize || 67_108_864);
+    const blocks = options.blocks ? String(options.blocks) : null;
     const started = Date.now();
     let settled = false;
     let stderr = "";
@@ -807,6 +808,7 @@ function mineSolutionCuda(challenge, state, stateFile, logEveryMs, options) {
       "--difficulty", String(difficulty),
       "--device", String(device),
       "--batch-size", batchSize,
+      ...(blocks ? ["--blocks", blocks] : []),
       "--start", startNonce.toString(),
       "--cutoff-ms", String(cutoffAt || 0),
       "--progress-ms", String(logEveryMs),
@@ -839,6 +841,7 @@ function mineSolutionCuda(challenge, state, stateFile, logEveryMs, options) {
             engine: "cuda",
             cuda_device: device,
             cuda_batch_size: batchSize,
+            cuda_blocks: blocks || "auto",
           };
           saveState(stateFile, state);
           log("info", "mining", {
@@ -862,6 +865,7 @@ function mineSolutionCuda(challenge, state, stateFile, logEveryMs, options) {
             engine: "cuda",
             cuda_device: device,
             cuda_batch_size: batchSize,
+            cuda_blocks: blocks || "auto",
           };
           saveState(stateFile, state);
           resolve({
@@ -988,10 +992,12 @@ async function main() {
     const mintLogFile = path.resolve(process.cwd(), args["mint-log"] || DEFAULT_MINT_LOG);
     const cudaDevice = Number(args["cuda-device"] || 0);
     const cudaBatchSize = args["cuda-batch-size"] || 1_073_741_824;
+    const cudaBlocks = args["cuda-blocks"] || null;
     if (!Number.isInteger(workers) || workers < 1) throw new Error("--workers must be a positive integer");
     if (!["native", "node", "cuda"].includes(engine)) throw new Error("--engine must be native, node, or cuda");
     if (engine === "cuda" && (!Number.isInteger(cudaDevice) || cudaDevice < 0)) throw new Error("--cuda-device must be a non-negative integer");
     if (engine === "cuda" && (!Number.isInteger(Number(cudaBatchSize)) || Number(cudaBatchSize) < 1)) throw new Error("--cuda-batch-size must be a positive integer");
+    if (engine === "cuda" && cudaBlocks !== null && (!Number.isInteger(Number(cudaBlocks)) || Number(cudaBlocks) < 1)) throw new Error("--cuda-blocks must be a positive integer");
     let minted = 0;
     const account = await client.api("GET", "/me");
     log("info", "miner identity", { miner_id: minerId, mint_log: mintLogFile });
@@ -1018,9 +1024,10 @@ async function main() {
           engine,
           cuda_device: engine === "cuda" ? cudaDevice : undefined,
           cuda_batch_size: engine === "cuda" ? cudaBatchSize : undefined,
+          cuda_blocks: engine === "cuda" ? (cudaBlocks || "auto") : undefined,
         });
         solution = engine === "cuda"
-          ? await mineSolutionCuda(challenge, client.state, client.stateFile, logEveryMs, { device: cudaDevice, batchSize: cudaBatchSize })
+          ? await mineSolutionCuda(challenge, client.state, client.stateFile, logEveryMs, { device: cudaDevice, batchSize: cudaBatchSize, blocks: cudaBlocks })
           : engine === "native"
             ? await mineSolutionNative(challenge, client.state, client.stateFile, logEveryMs, workers)
             : await mineSolutionParallel(challenge, client.state, client.stateFile, logEveryMs, workers);
@@ -1054,7 +1061,7 @@ async function main() {
           result,
           engine,
           workers,
-          engineOptions: engine === "cuda" ? { cuda_device: cudaDevice, cuda_batch_size: String(cudaBatchSize) } : {},
+          engineOptions: engine === "cuda" ? { cuda_device: cudaDevice, cuda_batch_size: String(cudaBatchSize), cuda_blocks: cudaBlocks ? String(cudaBlocks) : "auto" } : {},
         });
         appendJsonLine(mintLogFile, receipt);
         client.state.last_mint = result;
@@ -1110,6 +1117,7 @@ Options:
   --engine native|node|cuda  (native C miner recommended; cuda for NVIDIA GPUs)
   --cuda-device 0
   --cuda-batch-size 1073741824
+  --cuda-blocks auto
   --verbose`);
 }
 

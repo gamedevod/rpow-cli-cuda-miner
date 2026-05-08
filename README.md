@@ -238,6 +238,12 @@ Tune batch size if progress updates are too slow or kernel launches are too freq
 node rpow-cli.js mine --count 1 --engine cuda --cuda-device 0 --cuda-batch-size 67108864 --cookie-file .rpow-cookies.txt
 ```
 
+Tune CUDA block count if the GPU is underutilized. By default the miner uses `SM count * 32` blocks with 256 threads per block:
+
+```bash
+node rpow-cli.js mine --count 1 --engine cuda --cuda-device 0 --cuda-blocks 8192 --cookie-file .rpow-cookies.txt
+```
+
 ## Commands
 
 ### `map`
@@ -426,6 +432,14 @@ Number of nonces tested per CUDA kernel launch. Default: `1073741824`.
 
 ```powershell
 node rpow-cli.js mine --engine cuda --cuda-batch-size 1073741824
+```
+
+### `--cuda-blocks`
+
+CUDA block count for `--engine cuda`. Default: auto-detected as `SM count * 32`.
+
+```powershell
+node rpow-cli.js mine --engine cuda --cuda-blocks 8192
 ```
 
 ### `--fresh`

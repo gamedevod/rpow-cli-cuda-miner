@@ -188,34 +188,37 @@ __device__ void sha256_oneblock_state(uint64_t nonce, uint32_t state[8]) {
 
 __global__ void mine_kernel(uint64_t start_nonce, uint64_t batch_size, int difficulty, int *found,
                             uint64_t *solution, uint64_t *found_index, uint8_t *solution_hash) {
-  uint64_t idx = (uint64_t)blockIdx.x * (uint64_t)blockDim.x + (uint64_t)threadIdx.x;
-  if (idx >= batch_size || *found) return;
+  const uint64_t tid = (uint64_t)blockIdx.x * (uint64_t)blockDim.x + (uint64_t)threadIdx.x;
+  const uint64_t stride = (uint64_t)gridDim.x * (uint64_t)blockDim.x;
 
-  uint64_t nonce = start_nonce + idx;
-  uint8_t hash[32];
-  bool ok = false;
+  for (uint64_t idx = tid; idx < batch_size && !*found; idx += stride) {
+    uint64_t nonce = start_nonce + idx;
+    uint8_t hash[32];
+    bool ok = false;
 
-  if (c_prefix_len + 8 <= 55) {
-    uint32_t state[8];
-    sha256_oneblock_state(nonce, state);
-    ok = state_has_trailing_zero_bits(state, difficulty);
-    if (ok) digest_from_state(state, hash);
-  } else {
-    uint8_t nonce_bytes[8];
-    nonce_le(nonce, nonce_bytes);
-    sha256_ctx ctx;
-    sha256_init(&ctx);
-    sha256_update(&ctx, c_prefix, c_prefix_len);
-    sha256_update(&ctx, nonce_bytes, 8);
-    sha256_final(&ctx, hash);
-    ok = trailing_zero_bits(hash) >= difficulty;
-  }
+    if (c_prefix_len + 8 <= 55) {
+      uint32_t state[8];
+      sha256_oneblock_state(nonce, state);
+      ok = state_has_trailing_zero_bits(state, difficulty);
+      if (ok) digest_from_state(state, hash);
+    } else {
+      uint8_t nonce_bytes[8];
+      nonce_le(nonce, nonce_bytes);
+      sha256_ctx ctx;
+      sha256_init(&ctx);
+      sha256_update(&ctx, c_prefix, c_prefix_len);
+      sha256_update(&ctx, nonce_bytes, 8);
+      sha256_final(&ctx, hash);
+      ok = trailing_zero_bits(hash) >= difficulty;
+    }
 
-  if (ok) {
-    if (atomicCAS(found, 0, 1) == 0) {
-      *solution = nonce;
-      *found_index = idx;
-      for (int i = 0; i < 32; ++i) solution_hash[i] = hash[i];
+    if (ok) {
+      if (atomicCAS(found, 0, 1) == 0) {
+        *solution = nonce;
+        *found_index = idx;
+        for (int i = 0; i < 32; ++i) solution_hash[i] = hash[i];
+      }
+      return;
     }
   }
 }
@@ -226,7 +229,7 @@ static uint64_t now_ms(void) {
 }
 
 static void usage(FILE *out) {
-  fprintf(out, "usage: rpow-cuda-miner --prefix HEX --difficulty N [--device N] [--batch-size N] [--start N] [--cutoff-ms N] [--progress-ms N]\n");
+  fprintf(out, "usage: rpow-cuda-miner --prefix HEX --difficulty N [--device N] [--blocks N] [--batch-size N] [--start N] [--cutoff-ms N] [--progress-ms N]\n");
   fprintf(out, "       rpow-cuda-miner --self-test [--device N]\n");
 }
 
@@ -270,6 +273,7 @@ int main(int argc, char **argv) {
   int difficulty = 0, device = 0;
   uint64_t start_nonce = 0, cutoff_ms = 0, progress_ms = 1000;
   uint64_t batch_size = 1073741824ull;
+  int blocks = 0;
   bool self_test = false;
 
   for (int i = 1; i < argc; ++i) {
@@ -278,6 +282,7 @@ int main(int argc, char **argv) {
     else if (!strcmp(argv[i], "--prefix") && i + 1 < argc) prefix_hex = argv[++i];
     else if (!strcmp(argv[i], "--difficulty") && i + 1 < argc) difficulty = atoi(argv[++i]);
     else if (!strcmp(argv[i], "--device") && i + 1 < argc) device = atoi(argv[++i]);
+    else if (!strcmp(argv[i], "--blocks") && i + 1 < argc) blocks = atoi(argv[++i]);
     else if (!strcmp(argv[i], "--batch-size") && i + 1 < argc) batch_size = parse_u64(argv[++i]);
     else if (!strcmp(argv[i], "--start") && i + 1 < argc) start_nonce = parse_u64(argv[++i]);
     else if (!strcmp(argv[i], "--cutoff-ms") && i + 1 < argc) cutoff_ms = parse_u64(argv[++i]);
@@ -299,6 +304,13 @@ int main(int argc, char **argv) {
   }
 
   check_cuda(cudaSetDevice(device), "cudaSetDevice");
+  cudaDeviceProp props;
+  check_cuda(cudaGetDeviceProperties(&props, device), "cudaGetDeviceProperties");
+  if (blocks <= 0) blocks = props.multiProcessorCount * 32;
+  if (blocks <= 0) {
+    fprintf(stderr, "bad CUDA block count\n");
+    return 2;
+  }
   check_cuda(cudaMemcpyToSymbol(c_prefix, prefix, prefix_len), "cudaMemcpyToSymbol(prefix)");
   check_cuda(cudaMemcpyToSymbol(c_prefix_len, &prefix_len, sizeof(prefix_len)), "cudaMemcpyToSymbol(prefix_len)");
 
@@ -321,12 +333,7 @@ int main(int argc, char **argv) {
 
     int zero = 0;
     check_cuda(cudaMemcpy(d_found, &zero, sizeof(zero), cudaMemcpyHostToDevice), "cudaMemcpy(found)");
-    uint64_t blocks64 = (batch_size + (uint64_t)threads - 1ull) / (uint64_t)threads;
-    if (blocks64 > 2147483647ull) {
-      fprintf(stderr, "batch-size too large for one launch; lower --batch-size\n");
-      return 2;
-    }
-    mine_kernel<<<(unsigned int)blocks64, threads>>>(nonce, batch_size, difficulty, d_found, d_solution, d_found_index, d_solution_hash);
+    mine_kernel<<<blocks, threads>>>(nonce, batch_size, difficulty, d_found, d_solution, d_found_index, d_solution_hash);
     check_cuda(cudaGetLastError(), "mine_kernel launch");
     check_cuda(cudaDeviceSynchronize(), "mine_kernel");
 
