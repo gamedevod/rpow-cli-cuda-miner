@@ -907,6 +907,21 @@ async function promptLine(label) {
   }));
 }
 
+async function mapConcurrent(items, concurrency, mapper) {
+  const results = new Array(items.length);
+  let next = 0;
+  const workers = Array.from({ length: Math.min(concurrency, items.length) }, async () => {
+    while (true) {
+      const index = next;
+      next += 1;
+      if (index >= items.length) return;
+      results[index] = await mapper(items[index], index);
+    }
+  });
+  await Promise.all(workers);
+  return results;
+}
+
 async function main() {
   const args = parseArgs(process.argv.slice(2));
   globalThis.__RPOW_VERBOSE__ = args.verbose === true;
@@ -990,9 +1005,13 @@ async function main() {
     const cudaBatchSize = args["cuda-batch-size"] || 1_073_741_824;
     const cudaBlocks = args["cuda-blocks"] || null;
     const logEveryMs = Number(args["log-every-ms"] || 1000);
+    const prefetchWorkers = Number(args["prefetch-workers"] || Math.min(total, 64));
+    const mintWorkers = Number(args["mint-workers"] || Math.min(total, 32));
     const minerId = ensureMinerId(client, args["miner-id"] || `pool-test-${os.hostname()}`);
     const mintLogFile = path.resolve(process.cwd(), args["mint-log"] || DEFAULT_MINT_LOG);
     if (!Number.isInteger(total) || total < 1) throw new Error("--challenges must be a positive integer");
+    if (!Number.isInteger(prefetchWorkers) || prefetchWorkers < 1) throw new Error("--prefetch-workers must be a positive integer");
+    if (!Number.isInteger(mintWorkers) || mintWorkers < 1) throw new Error("--mint-workers must be a positive integer");
     if (engine !== "cuda") throw new Error("pool-test currently supports --engine cuda only");
     if (!Number.isInteger(cudaDevice) || cudaDevice < 0) throw new Error("--cuda-device must be a non-negative integer");
     if (!Number.isInteger(Number(cudaBatchSize)) || Number(cudaBatchSize) < 1) throw new Error("--cuda-batch-size must be a positive integer");
@@ -1002,7 +1021,7 @@ async function main() {
     const batchId = crypto.randomUUID();
     const challenges = [];
     const solved = [];
-    const summary = { requested: 0, solved: 0, accepted: 0, mint_failed: 0, solve_failed: 0 };
+    const summary = { requested: 0, request_failed: 0, solved: 0, accepted: 0, mint_failed: 0, solve_failed: 0 };
     const failures = {};
     log("info", "pool-test start", {
       batch_id: batchId,
@@ -1011,21 +1030,33 @@ async function main() {
       cuda_device: cudaDevice,
       cuda_batch_size: cudaBatchSize,
       cuda_blocks: cudaBlocks || "auto",
+      prefetch_workers: prefetchWorkers,
+      mint_workers: mintWorkers,
       miner_id: minerId,
     });
 
-    for (let i = 0; i < total; i += 1) {
-      const challenge = await client.api("POST", "/challenge");
-      challenges.push(challenge);
-      summary.requested += 1;
-      log("info", "pool-test challenge", {
-        index: i + 1,
-        total,
-        id: challenge.challenge_id,
-        difficulty: `${challenge.difficulty_bits} bits`,
-        expires: challenge.expires_at,
-      });
-    }
+    const indices = Array.from({ length: total }, (_, i) => i);
+    const fetched = await mapConcurrent(indices, prefetchWorkers, async (i) => {
+      try {
+        const challenge = await client.api("POST", "/challenge");
+        summary.requested += 1;
+        log("info", "pool-test challenge", {
+          index: i + 1,
+          total,
+          id: challenge.challenge_id,
+          difficulty: `${challenge.difficulty_bits} bits`,
+          expires: challenge.expires_at,
+        });
+        return challenge;
+      } catch (err) {
+        summary.request_failed += 1;
+        const key = err.code || String(err.status || "REQUEST_FAILED");
+        failures[key] = (failures[key] || 0) + 1;
+        log("warn", "pool-test challenge failed", { index: i + 1, total, error: err.message, code: err.code, status: err.status });
+        return null;
+      }
+    });
+    challenges.push(...fetched.filter(Boolean));
 
     for (let i = 0; i < challenges.length; i += 1) {
       const challenge = challenges[i];
@@ -1056,8 +1087,7 @@ async function main() {
       }
     }
 
-    for (let i = 0; i < solved.length; i += 1) {
-      const { challenge, solution } = solved[i];
+    await mapConcurrent(solved, mintWorkers, async ({ challenge, solution }, i) => {
       try {
         log("info", "pool-test mint", { index: i + 1, total: solved.length, id: challenge.challenge_id });
         const result = await client.api("POST", "/mint", {
@@ -1094,7 +1124,7 @@ async function main() {
         failures[key] = (failures[key] || 0) + 1;
         log("warn", "pool-test mint failed", { id: challenge.challenge_id, error: err.message, code: err.code, status: err.status });
       }
-    }
+    });
 
     client.state.challenge = null;
     client.state.mining = null;
