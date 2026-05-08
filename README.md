@@ -226,6 +226,12 @@ Quick CUDA self-test:
 ./rpow-cuda-miner --self-test --device 0
 ```
 
+Measure raw CUDA kernel speed without API latency or early-solution timing noise:
+
+```bash
+./rpow-cuda-miner --benchmark-ms 5000 --prefix 00 --device 0 --blocks 8192 --batch-size 1073741824
+```
+
 Run one mint on GPU:
 
 ```bash

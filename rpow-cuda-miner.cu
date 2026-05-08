@@ -270,6 +270,17 @@ __global__ void mine_kernel(uint64_t start_nonce, uint64_t batch_size, int diffi
   }
 }
 
+__global__ void benchmark_kernel(uint64_t start_nonce, uint64_t batch_size, uint64_t *sink) {
+  const uint64_t tid = (uint64_t)blockIdx.x * (uint64_t)blockDim.x + (uint64_t)threadIdx.x;
+  const uint64_t stride = (uint64_t)gridDim.x * (uint64_t)blockDim.x;
+  uint64_t local = 0;
+
+  for (uint64_t idx = tid; idx < batch_size; idx += stride) {
+    local += (uint64_t)sha256_oneblock_low_word(start_nonce + idx);
+  }
+  atomicAdd((unsigned long long *)&sink[blockIdx.x], (unsigned long long)local);
+}
+
 static uint64_t now_ms(void) {
   using namespace std::chrono;
   return (uint64_t)duration_cast<milliseconds>(system_clock::now().time_since_epoch()).count();
@@ -277,6 +288,7 @@ static uint64_t now_ms(void) {
 
 static void usage(FILE *out) {
   fprintf(out, "usage: rpow-cuda-miner --prefix HEX --difficulty N [--device N] [--blocks N] [--batch-size N] [--start N] [--cutoff-ms N] [--progress-ms N]\n");
+  fprintf(out, "       rpow-cuda-miner --benchmark-ms N --prefix HEX [--device N] [--blocks N] [--batch-size N]\n");
   fprintf(out, "       rpow-cuda-miner --self-test [--device N]\n");
 }
 
@@ -320,12 +332,14 @@ int main(int argc, char **argv) {
   int difficulty = 0, device = 0;
   uint64_t start_nonce = 0, cutoff_ms = 0, progress_ms = 1000;
   uint64_t batch_size = 1073741824ull;
+  uint64_t benchmark_ms = 0;
   int blocks = 0;
   bool self_test = false;
 
   for (int i = 1; i < argc; ++i) {
     if (!strcmp(argv[i], "--help") || !strcmp(argv[i], "-h")) { usage(stdout); return 0; }
     else if (!strcmp(argv[i], "--self-test")) self_test = true;
+    else if (!strcmp(argv[i], "--benchmark-ms") && i + 1 < argc) benchmark_ms = parse_u64(argv[++i]);
     else if (!strcmp(argv[i], "--prefix") && i + 1 < argc) prefix_hex = argv[++i];
     else if (!strcmp(argv[i], "--difficulty") && i + 1 < argc) difficulty = atoi(argv[++i]);
     else if (!strcmp(argv[i], "--device") && i + 1 < argc) device = atoi(argv[++i]);
@@ -345,7 +359,7 @@ int main(int argc, char **argv) {
     progress_ms = 0;
   }
 
-  if (!prefix_hex || parse_hex(prefix_hex, prefix, &prefix_len) || difficulty <= 0 || difficulty > 256 || batch_size == 0) {
+  if (!prefix_hex || parse_hex(prefix_hex, prefix, &prefix_len) || (!benchmark_ms && (difficulty <= 0 || difficulty > 256)) || batch_size == 0) {
     usage(stderr);
     return 2;
   }
@@ -373,13 +387,32 @@ int main(int argc, char **argv) {
   int *d_found = NULL;
   uint64_t *d_solution = NULL, *d_found_index = NULL;
   uint8_t *d_solution_hash = NULL;
+  uint64_t *d_sink = NULL;
   check_cuda(cudaMalloc((void **)&d_found, sizeof(int)), "cudaMalloc(found)");
   check_cuda(cudaMalloc((void **)&d_solution, sizeof(uint64_t)), "cudaMalloc(solution)");
   check_cuda(cudaMalloc((void **)&d_found_index, sizeof(uint64_t)), "cudaMalloc(found_index)");
   check_cuda(cudaMalloc((void **)&d_solution_hash, 32), "cudaMalloc(solution_hash)");
+  check_cuda(cudaMalloc((void **)&d_sink, (size_t)blocks * sizeof(uint64_t)), "cudaMalloc(sink)");
 
   uint64_t total_hashes = 0, nonce = start_nonce, last_progress = now_ms();
   const int threads = 256;
+  if (benchmark_ms) {
+    const uint64_t started = now_ms();
+    while (now_ms() - started < benchmark_ms) {
+      check_cuda(cudaMemset(d_sink, 0, (size_t)blocks * sizeof(uint64_t)), "cudaMemset(sink)");
+      benchmark_kernel<<<blocks, threads>>>(nonce, batch_size, d_sink);
+      check_cuda(cudaGetLastError(), "benchmark_kernel launch");
+      check_cuda(cudaDeviceSynchronize(), "benchmark_kernel");
+      nonce += batch_size;
+      total_hashes += batch_size;
+    }
+    const uint64_t elapsed = now_ms() - started;
+    double ghps = elapsed ? ((double)total_hashes / ((double)elapsed / 1000.0) / 1000000000.0) : 0.0;
+    printf("{\"type\":\"benchmark\",\"hashes\":\"%" PRIu64 "\",\"elapsed_ms\":\"%" PRIu64 "\",\"speed_ghs\":\"%.3f\"}\n", total_hashes, elapsed, ghps);
+    fflush(stdout);
+    return 0;
+  }
+
   while (true) {
     if (cutoff_ms && now_ms() >= cutoff_ms) {
       printf("{\"type\":\"expired\",\"hashes\":\"%" PRIu64 "\"}\n", total_hashes);
