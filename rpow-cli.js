@@ -257,7 +257,21 @@ function importCookieFile(client, cookieFile) {
   client.state.cookies = cookies;
   client.state.cookies_imported_at = new Date().toISOString();
   client.save();
-  log("success", "cookies imported", { count: Object.keys(cookies).length });
+  log("success", "cookies imported", { count: Object.keys(cookies).length, has_rpow_session: Boolean(cookies.rpow_session) });
+  if (!cookies.rpow_session) {
+    log("warn", "cookie file does not contain rpow_session; /me will probably return 401");
+  }
+}
+
+function printCookieFileInfo(cookieFile) {
+  const file = path.resolve(process.cwd(), cookieFile);
+  const cookies = parseCookieHeader(fs.readFileSync(file, "utf8"));
+  const names = Object.keys(cookies).sort();
+  log("info", "cookie file", {
+    count: names.length,
+    has_rpow_session: Boolean(cookies.rpow_session),
+    names: names.join(","),
+  });
 }
 
 function storeSetCookies(state, setCookieHeaders) {
@@ -904,6 +918,12 @@ async function main() {
 
   if (args["cookie-file"]) importCookieFile(client, args["cookie-file"]);
 
+  if (command === "cookies") {
+    if (!args["cookie-file"]) throw new Error("cookies command requires --cookie-file PATH");
+    printCookieFileInfo(args["cookie-file"]);
+    return;
+  }
+
   if (command === "map") {
     printApiMap(discovered);
     return;
@@ -1069,6 +1089,7 @@ async function main() {
   node rpow-cli.js map
   node rpow-cli.js login --email you@example.com
   node rpow-cli.js complete-login --link "https://..."
+  node rpow-cli.js cookies --cookie-file .rpow-cookies.txt
   node rpow-cli.js me
   node rpow-cli.js mine --count 1 --engine native
   node rpow-cli.js run --count 3 --engine native
