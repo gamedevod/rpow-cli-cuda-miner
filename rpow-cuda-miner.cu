@@ -156,6 +156,12 @@ __device__ __forceinline__ bool state_has_trailing_zero_bits(const uint32_t stat
   return true;
 }
 
+__device__ __forceinline__ bool low_word_has_trailing_zero_bits(uint32_t word, int difficulty) {
+  if (difficulty <= 0) return true;
+  if (difficulty >= 32) return word == 0;
+  return (word & ((1u << difficulty) - 1u)) == 0;
+}
+
 __device__ __forceinline__ void sha256_oneblock_state(uint64_t nonce, uint32_t state[8]) {
   uint32_t a,b,c,d,e,f,g,h,t1,t2,w[16];
   #pragma unroll
@@ -188,6 +194,36 @@ __device__ __forceinline__ void sha256_oneblock_state(uint64_t nonce, uint32_t s
   state[4]=0x510e527f + e; state[5]=0x9b05688c + f; state[6]=0x1f83d9ab + g; state[7]=0x5be0cd19 + h;
 }
 
+__device__ __forceinline__ uint32_t sha256_oneblock_low_word(uint64_t nonce) {
+  uint32_t a,b,c,d,e,f,g,h,t1,t2,w[16];
+  #pragma unroll
+  for (int i = 0; i < 16; ++i) w[i] = c_base_words[i];
+
+  size_t off = c_nonce_offset;
+  #pragma unroll
+  for (int i = 0; i < 8; ++i) {
+    set_message_byte(w, off + (size_t)i, (uint8_t)(nonce & 0xffu));
+    nonce >>= 8;
+  }
+
+  a=0x6a09e667; b=0xbb67ae85; c=0x3c6ef372; d=0xa54ff53a;
+  e=0x510e527f; f=0x9b05688c; g=0x1f83d9ab; h=0x5be0cd19;
+  #pragma unroll 64
+  for (int i = 0; i < 64; ++i) {
+    uint32_t wi;
+    if (i < 16) {
+      wi = w[i];
+    } else {
+      wi = SIG1(w[(i - 2) & 15]) + w[(i - 7) & 15] + SIG0(w[(i - 15) & 15]) + w[i & 15];
+      w[i & 15] = wi;
+    }
+    t1 = h + EP1(e) + CH(e,f,g) + k[i] + wi;
+    t2 = EP0(a) + MAJ(a,b,c);
+    h=g; g=f; f=e; e=d+t1; d=c; c=b; b=a; a=t1+t2;
+  }
+  return 0x5be0cd19 + h;
+}
+
 __global__ void mine_kernel(uint64_t start_nonce, uint64_t batch_size, int difficulty, int *found,
                             uint64_t *solution, uint64_t *found_index, uint8_t *solution_hash) {
   const uint64_t tid = (uint64_t)blockIdx.x * (uint64_t)blockDim.x + (uint64_t)threadIdx.x;
@@ -199,10 +235,19 @@ __global__ void mine_kernel(uint64_t start_nonce, uint64_t batch_size, int diffi
     bool ok = false;
 
     if (c_prefix_len + 8 <= 55) {
-      uint32_t state[8];
-      sha256_oneblock_state(nonce, state);
-      ok = state_has_trailing_zero_bits(state, difficulty);
-      if (ok) digest_from_state(state, hash);
+      if (difficulty <= 32) {
+        ok = low_word_has_trailing_zero_bits(sha256_oneblock_low_word(nonce), difficulty);
+        if (ok) {
+          uint32_t state[8];
+          sha256_oneblock_state(nonce, state);
+          digest_from_state(state, hash);
+        }
+      } else {
+        uint32_t state[8];
+        sha256_oneblock_state(nonce, state);
+        ok = state_has_trailing_zero_bits(state, difficulty);
+        if (ok) digest_from_state(state, hash);
+      }
     } else {
       uint8_t nonce_bytes[8];
       nonce_le(nonce, nonce_bytes);
