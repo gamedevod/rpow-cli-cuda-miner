@@ -238,6 +238,24 @@ Run one mint on GPU:
 node rpow-cli.js mine --count 1 --engine cuda --cuda-device 0 --cookie-file .rpow-cookies.txt
 ```
 
+Run a continuous CUDA pool across 8 RTX 5090 GPUs. This keeps a local challenge buffer full, solves challenges in parallel, and submits solved mints in parallel. Omit `--count` for continuous mining, or set `--count N` to stop after roughly N accepted mints:
+
+```bash
+node rpow-cli.js pool \
+  --engine cuda \
+  --cuda-devices 0,1,2,3,4,5,6,7 \
+  --challenge-buffer 300 \
+  --prefetch-workers 300 \
+  --solve-workers 8 \
+  --mint-workers 300 \
+  --cuda-blocks 32768 \
+  --cuda-batch-size 1073741824 \
+  --timeout 60000 \
+  --retry-delay-ms 2000 \
+  --miner-id pool-8x5090 \
+  --cookie-file .rpow-cookies.txt
+```
+
 Test whether the backend accepts a pipelined pool of challenges. This fetches challenges in parallel, solves them in parallel across CUDA devices, and submits solved mints in parallel as soon as each solution is ready:
 
 ```bash
