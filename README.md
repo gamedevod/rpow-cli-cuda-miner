@@ -226,6 +226,12 @@ Quick CUDA self-test:
 ./rpow-cuda-miner --self-test --device 0
 ```
 
+Quick persistent worker self-test:
+
+```bash
+printf '%s\n' '{"id":"test","prefix":"00","difficulty":8,"start":"0","cutoff_ms":"0"}' '{"type":"shutdown"}' | ./rpow-cuda-miner --worker --device 0
+```
+
 Measure raw CUDA kernel speed without API latency or early-solution timing noise:
 
 ```bash
@@ -238,7 +244,7 @@ Run one mint on GPU:
 node rpow-cli.js mine --count 1 --engine cuda --cuda-device 0 --cookie-file .rpow-cookies.txt
 ```
 
-Run a continuous CUDA pool across 8 RTX 5090 GPUs. This keeps a local challenge buffer full, solves challenges in parallel, and submits solved mints in parallel. Omit `--count` for continuous mining, or set `--count N` to stop after roughly N accepted mints:
+Run a continuous CUDA pool across 8 RTX 5090 GPUs. This keeps a local challenge buffer full, runs persistent CUDA worker processes so the CUDA context stays warm, solves challenges in parallel, and submits solved mints in parallel. Omit `--count` for continuous mining, or set `--count N` to stop after roughly N accepted mints:
 
 ```bash
 node rpow-cli.js pool \
@@ -255,6 +261,8 @@ node rpow-cli.js pool \
   --miner-id pool-8x5090 \
   --cookie-file .rpow-cookies.txt
 ```
+
+For high-throughput CUDA mining, prefer `pool` over starting separate `mine` processes. `pool` keeps one long-lived CUDA worker per solve worker and avoids paying CUDA process/context startup cost for every challenge.
 
 Test whether the backend accepts a pipelined pool of challenges. This fetches challenges in parallel, solves them in parallel across CUDA devices, and submits solved mints in parallel as soon as each solution is ready:
 

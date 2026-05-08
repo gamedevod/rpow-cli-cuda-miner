@@ -899,6 +899,153 @@ function mineSolutionCuda(challenge, state, stateFile, logEveryMs, options) {
   });
 }
 
+class PersistentCudaMiner {
+  constructor(options) {
+    const cudaMiner = cudaMinerPath();
+    if (!cudaMiner) {
+      throw new Error(`CUDA miner not built; expected one of: ${CUDA_MINER_CANDIDATES.join(", ")}`);
+    }
+    this.device = Number(options.device || 0);
+    this.batchSize = String(options.batchSize || 1_073_741_824);
+    this.blocks = options.blocks ? String(options.blocks) : null;
+    this.logEveryMs = Number(options.logEveryMs || 1000);
+    this.current = null;
+    this.buffer = "";
+    this.stderr = "";
+    this.closed = false;
+    this.child = spawn(cudaMiner, [
+      "--worker",
+      "--device", String(this.device),
+      "--batch-size", this.batchSize,
+      ...(this.blocks ? ["--blocks", this.blocks] : []),
+      "--progress-ms", String(this.logEveryMs),
+    ], { windowsHide: true });
+
+    this.child.stdout.on("data", (chunk) => this.onStdout(chunk));
+    this.child.stderr.on("data", (chunk) => {
+      this.stderr += chunk.toString("utf8");
+      if (this.stderr.length > 8192) this.stderr = this.stderr.slice(-8192);
+    });
+    this.child.on("error", (err) => this.failCurrent(err));
+    this.child.on("exit", (code) => {
+      this.closed = true;
+      if (this.current) {
+        this.failCurrent(new Error(`persistent CUDA miner exited with code ${code}${this.stderr ? `: ${this.stderr.trim()}` : ""}`));
+      }
+    });
+  }
+
+  onStdout(chunk) {
+    this.buffer += chunk.toString("utf8");
+    while (this.buffer.includes("\n")) {
+      const idx = this.buffer.indexOf("\n");
+      const line = this.buffer.slice(0, idx).trim();
+      this.buffer = this.buffer.slice(idx + 1);
+      if (!line) continue;
+      let message;
+      try {
+        message = JSON.parse(line);
+      } catch {
+        log("warn", "persistent CUDA miner emitted non-json line", { device: this.device, line });
+        continue;
+      }
+      if (message.type === "ready") {
+        log("info", "persistent CUDA worker ready", { device: this.device, blocks: message.blocks, batch_size: message.batch_size });
+        continue;
+      }
+      if (!this.current) {
+        log("warn", "persistent CUDA miner emitted message without active task", { device: this.device, type: message.type });
+        continue;
+      }
+      if (message.id && message.id !== this.current.id) {
+        log("warn", "persistent CUDA miner emitted stale task message", { device: this.device, type: message.type, id: message.id });
+        continue;
+      }
+      if (message.type === "progress") {
+        const hashes = BigInt(message.hashes || "0");
+        const seconds = Math.max(1, (Date.now() - this.current.started) / 1000);
+        const rate = Number(hashes) / seconds;
+        log("info", "mining", {
+          hashes: hashes.toString(),
+          nonce: message.nonce,
+          device: this.device,
+          engine: "cuda-persistent",
+          speed: `${(rate / 1_000_000).toFixed(2)} MH/s`,
+        });
+        continue;
+      }
+      if (message.type === "found") {
+        const current = this.current;
+        this.current = null;
+        const hashes = BigInt(message.hashes || "0");
+        const seconds = Math.max(0.001, (Date.now() - current.started) / 1000);
+        const rate = Number(hashes) / seconds;
+        current.resolve({
+          solution_nonce: message.solution_nonce,
+          hashes: message.hashes,
+          digest: message.digest,
+          speed: `${(rate / 1_000_000).toFixed(2)} MH/s`,
+          elapsed_ms: Date.now() - current.started,
+        });
+        continue;
+      }
+      if (message.type === "expired") {
+        const current = this.current;
+        this.current = null;
+        const err = new Error("challenge expired before a solution was found");
+        err.code = "CHALLENGE_EXPIRED";
+        err.retryable = true;
+        current.reject(err);
+        continue;
+      }
+      if (message.type === "error") {
+        const current = this.current;
+        this.current = null;
+        current.reject(new Error(message.error || "persistent CUDA miner task failed"));
+      }
+    }
+  }
+
+  failCurrent(err) {
+    if (!this.current) return;
+    const current = this.current;
+    this.current = null;
+    current.reject(err);
+  }
+
+  mine(challenge) {
+    if (this.closed) return Promise.reject(new Error("persistent CUDA miner is closed"));
+    if (this.current) return Promise.reject(new Error("persistent CUDA miner is busy"));
+    const difficulty = Number(challenge.difficulty_bits);
+    const expiresAt = challenge.expires_at ? Date.parse(challenge.expires_at) : null;
+    const cutoffAt = Number.isFinite(expiresAt) ? expiresAt - 5000 : 0;
+    const id = crypto.randomUUID();
+    const payload = {
+      id,
+      prefix: challenge.nonce_prefix,
+      difficulty,
+      start: "0",
+      cutoff_ms: String(cutoffAt || 0),
+    };
+    return new Promise((resolve, reject) => {
+      this.current = { id, resolve, reject, started: Date.now() };
+      this.child.stdin.write(`${JSON.stringify(payload)}\n`, (err) => {
+        if (err) this.failCurrent(err);
+      });
+    });
+  }
+
+  close() {
+    this.closed = true;
+    try {
+      if (!this.child.killed) this.child.stdin.write("{\"type\":\"shutdown\"}\n");
+    } catch {}
+    try {
+      if (!this.child.killed) this.child.stdin.end();
+    } catch {}
+  }
+}
+
 async function promptLine(label) {
   const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
   return new Promise((resolve) => rl.question(label, (answer) => {
@@ -1096,6 +1243,8 @@ async function main() {
       active_mints: 0,
     };
     const failures = {};
+    const poolStartedAt = Date.now();
+    let lastStats = { at: poolStartedAt, requested: 0, solved: 0, accepted: 0 };
     let stopRequested = false;
     let nextIndex = 0;
 
@@ -1127,15 +1276,23 @@ async function main() {
       mint_workers: mintWorkers,
       cuda_batch_size: cudaBatchSize,
       cuda_blocks: cudaBlocks || "auto",
+      cuda_persistent: true,
       miner_id: minerId,
     });
 
     const statsTimer = setInterval(() => {
+      const now = Date.now();
+      const elapsedMinutes = Math.max(0.001, (now - poolStartedAt) / 60000);
+      const statsMinutes = Math.max(0.001, (now - lastStats.at) / 60000);
       log("info", "pool stats", {
         requested: summary.requested,
         request_failed: summary.request_failed,
         solved: summary.solved,
         accepted: summary.accepted,
+        accepted_per_min: (summary.accepted / elapsedMinutes).toFixed(2),
+        recent_accepted_per_min: ((summary.accepted - lastStats.accepted) / statsMinutes).toFixed(2),
+        recent_requested_per_min: ((summary.requested - lastStats.requested) / statsMinutes).toFixed(2),
+        recent_solved_per_min: ((summary.solved - lastStats.solved) / statsMinutes).toFixed(2),
         mint_failed: summary.mint_failed,
         solve_failed: summary.solve_failed,
         challenge_queue: challengeQueue.length,
@@ -1144,6 +1301,7 @@ async function main() {
         active_mints: summary.active_mints,
         failures,
       });
+      lastStats = { at: now, requested: summary.requested, solved: summary.solved, accepted: summary.accepted };
     }, statsEveryMs);
 
     const fetchTasks = Array.from({ length: prefetchWorkers }, async () => {
@@ -1173,23 +1331,24 @@ async function main() {
       }
     });
 
+    const cudaWorkers = Array.from({ length: solveWorkers }, (_, workerIndex) => new PersistentCudaMiner({
+      device: cudaDevices[workerIndex % cudaDevices.length],
+      batchSize: cudaBatchSize,
+      blocks: cudaBlocks,
+      logEveryMs,
+    }));
+
     const solveTasks = Array.from({ length: solveWorkers }, async (_, workerIndex) => {
       const solveDevice = cudaDevices[workerIndex % cudaDevices.length];
+      const cudaWorker = cudaWorkers[workerIndex];
       while (true) {
         const item = await challengeQueue.shift();
         if (item.done) return;
         const { challenge, index } = item.value;
-        const solveState = {
-          mining: { challenge_id: challenge.challenge_id, nonce: "0", hashes: "0", difficulty_bits: challenge.difficulty_bits, engine: "cuda" },
-        };
         summary.active_solves += 1;
         try {
           log("info", "pool solve", { index: index + 1, id: challenge.challenge_id, cuda_device: solveDevice });
-          const solution = await mineSolutionCuda(challenge, solveState, null, logEveryMs, {
-            device: solveDevice,
-            batchSize: cudaBatchSize,
-            blocks: cudaBlocks,
-          });
+          const solution = await cudaWorker.mine(challenge);
           summary.solved += 1;
           solutionQueue.push({ challenge, solution, index, solveDevice });
           log("info", "pool solved", {
@@ -1234,6 +1393,7 @@ async function main() {
             workers: 0,
             engineOptions: {
               pool: true,
+              cuda_persistent: true,
               batch_id: batchId,
               cuda_device: solveDevice,
               cuda_batch_size: String(cudaBatchSize),
@@ -1264,6 +1424,7 @@ async function main() {
     await Promise.all(fetchTasks);
     challengeQueue.close();
     await Promise.all(solveTasks);
+    for (const cudaWorker of cudaWorkers) cudaWorker.close();
     solutionQueue.close();
     await Promise.all(mintTasks);
     clearInterval(statsTimer);

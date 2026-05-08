@@ -8,6 +8,7 @@
 #include <string.h>
 
 #include <chrono>
+#include <string>
 
 typedef struct {
   uint8_t data[64];
@@ -288,6 +289,7 @@ static uint64_t now_ms(void) {
 
 static void usage(FILE *out) {
   fprintf(out, "usage: rpow-cuda-miner --prefix HEX --difficulty N [--device N] [--blocks N] [--batch-size N] [--start N] [--cutoff-ms N] [--progress-ms N]\n");
+  fprintf(out, "       rpow-cuda-miner --worker [--device N] [--blocks N] [--batch-size N] [--progress-ms N]\n");
   fprintf(out, "       rpow-cuda-miner --benchmark-ms N --prefix HEX [--device N] [--blocks N] [--batch-size N]\n");
   fprintf(out, "       rpow-cuda-miner --self-test [--device N]\n");
 }
@@ -325,20 +327,184 @@ static void check_cuda(cudaError_t err, const char *label) {
   }
 }
 
-int main(int argc, char **argv) {
+typedef struct {
+  int *d_found;
+  uint64_t *d_solution;
+  uint64_t *d_found_index;
+  uint8_t *d_solution_hash;
+  uint64_t *d_sink;
+} cuda_buffers;
+
+static void configure_prefix(const char *prefix_hex, uint8_t *prefix, size_t *prefix_len) {
+  uint32_t base_words[16] = {0};
+  if (parse_hex(prefix_hex, prefix, prefix_len)) {
+    fprintf(stderr, "bad prefix hex\n");
+    exit(2);
+  }
+  if (*prefix_len + 8 <= 55) {
+    for (size_t i = 0; i < *prefix_len; ++i) set_message_byte(base_words, i, prefix[i]);
+    set_message_byte(base_words, *prefix_len + 8, 0x80);
+    base_words[15] = (uint32_t)((*prefix_len + 8) * 8);
+  }
+  check_cuda(cudaMemcpyToSymbol(c_prefix, prefix, *prefix_len), "cudaMemcpyToSymbol(prefix)");
+  check_cuda(cudaMemcpyToSymbol(c_prefix_len, prefix_len, sizeof(*prefix_len)), "cudaMemcpyToSymbol(prefix_len)");
+  check_cuda(cudaMemcpyToSymbol(c_base_words, base_words, sizeof(base_words)), "cudaMemcpyToSymbol(base_words)");
+  check_cuda(cudaMemcpyToSymbol(c_nonce_offset, prefix_len, sizeof(*prefix_len)), "cudaMemcpyToSymbol(nonce_offset)");
+}
+
+static void alloc_buffers(cuda_buffers *buffers, int blocks) {
+  check_cuda(cudaMalloc((void **)&buffers->d_found, sizeof(int)), "cudaMalloc(found)");
+  check_cuda(cudaMalloc((void **)&buffers->d_solution, sizeof(uint64_t)), "cudaMalloc(solution)");
+  check_cuda(cudaMalloc((void **)&buffers->d_found_index, sizeof(uint64_t)), "cudaMalloc(found_index)");
+  check_cuda(cudaMalloc((void **)&buffers->d_solution_hash, 32), "cudaMalloc(solution_hash)");
+  check_cuda(cudaMalloc((void **)&buffers->d_sink, (size_t)blocks * sizeof(uint64_t)), "cudaMalloc(sink)");
+}
+
+static void free_buffers(cuda_buffers *buffers) {
+  if (buffers->d_found) cudaFree(buffers->d_found);
+  if (buffers->d_solution) cudaFree(buffers->d_solution);
+  if (buffers->d_found_index) cudaFree(buffers->d_found_index);
+  if (buffers->d_solution_hash) cudaFree(buffers->d_solution_hash);
+  if (buffers->d_sink) cudaFree(buffers->d_sink);
+}
+
+static void print_id_field(const char *task_id) {
+  if (task_id && task_id[0]) printf(",\"id\":\"%s\"", task_id);
+}
+
+static bool json_get_string(const char *line, const char *key, char *out, size_t out_size) {
+  char pattern[64];
+  snprintf(pattern, sizeof(pattern), "\"%s\"", key);
+  const char *p = strstr(line, pattern);
+  if (!p) return false;
+  p += strlen(pattern);
+  while (*p == ' ' || *p == '\t' || *p == '\r' || *p == '\n') ++p;
+  if (*p != ':') return false;
+  ++p;
+  while (*p == ' ' || *p == '\t' || *p == '\r' || *p == '\n') ++p;
+  if (*p != '"') return false;
+  ++p;
+  size_t n = 0;
+  while (*p && *p != '"' && n + 1 < out_size) out[n++] = *p++;
+  out[n] = '\0';
+  return *p == '"';
+}
+
+static bool json_get_u64(const char *line, const char *key, uint64_t *out) {
+  char pattern[64];
+  snprintf(pattern, sizeof(pattern), "\"%s\"", key);
+  const char *p = strstr(line, pattern);
+  if (!p) return false;
+  p += strlen(pattern);
+  while (*p == ' ' || *p == '\t' || *p == '\r' || *p == '\n') ++p;
+  if (*p != ':') return false;
+  ++p;
+  while (*p == ' ' || *p == '\t' || *p == '\r' || *p == '\n' || *p == '"') ++p;
+  errno = 0;
+  char *end = NULL;
+  uint64_t value = strtoull(p, &end, 10);
+  if (errno || end == p) return false;
+  *out = value;
+  return true;
+}
+
+static bool json_get_int(const char *line, const char *key, int *out) {
+  uint64_t value = 0;
+  if (!json_get_u64(line, key, &value) || value > 256) return false;
+  *out = (int)value;
+  return true;
+}
+
+static int run_benchmark(cuda_buffers *buffers, const char *prefix_hex, uint64_t batch_size, int blocks, uint64_t benchmark_ms) {
   uint8_t prefix[64] = {0};
   size_t prefix_len = 0;
+  configure_prefix(prefix_hex, prefix, &prefix_len);
+  uint64_t total_hashes = 0, nonce = 0;
+  const int threads = 256;
+  const uint64_t started = now_ms();
+  while (now_ms() - started < benchmark_ms) {
+    check_cuda(cudaMemset(buffers->d_sink, 0, (size_t)blocks * sizeof(uint64_t)), "cudaMemset(sink)");
+    benchmark_kernel<<<blocks, threads>>>(nonce, batch_size, buffers->d_sink);
+    check_cuda(cudaGetLastError(), "benchmark_kernel launch");
+    check_cuda(cudaDeviceSynchronize(), "benchmark_kernel");
+    nonce += batch_size;
+    total_hashes += batch_size;
+  }
+  const uint64_t elapsed = now_ms() - started;
+  double ghps = elapsed ? ((double)total_hashes / ((double)elapsed / 1000.0) / 1000000000.0) : 0.0;
+  printf("{\"type\":\"benchmark\",\"hashes\":\"%" PRIu64 "\",\"elapsed_ms\":\"%" PRIu64 "\",\"speed_ghs\":\"%.3f\"}\n", total_hashes, elapsed, ghps);
+  fflush(stdout);
+  return 0;
+}
+
+static int run_mine_task(cuda_buffers *buffers, const char *task_id, const char *prefix_hex, int difficulty,
+                         uint64_t start_nonce, uint64_t cutoff_ms, uint64_t progress_ms,
+                         uint64_t batch_size, int blocks) {
+  uint8_t prefix[64] = {0};
+  size_t prefix_len = 0;
+  configure_prefix(prefix_hex, prefix, &prefix_len);
+
+  uint64_t total_hashes = 0, nonce = start_nonce, last_progress = now_ms();
+  const int threads = 256;
+  while (true) {
+    if (cutoff_ms && now_ms() >= cutoff_ms) {
+      printf("{\"type\":\"expired\"");
+      print_id_field(task_id);
+      printf(",\"hashes\":\"%" PRIu64 "\"}\n", total_hashes);
+      fflush(stdout);
+      return 0;
+    }
+
+    int zero = 0;
+    check_cuda(cudaMemcpy(buffers->d_found, &zero, sizeof(zero), cudaMemcpyHostToDevice), "cudaMemcpy(found)");
+    mine_kernel<<<blocks, threads>>>(nonce, batch_size, difficulty, buffers->d_found, buffers->d_solution, buffers->d_found_index, buffers->d_solution_hash);
+    check_cuda(cudaGetLastError(), "mine_kernel launch");
+    check_cuda(cudaDeviceSynchronize(), "mine_kernel");
+
+    int found = 0;
+    check_cuda(cudaMemcpy(&found, buffers->d_found, sizeof(found), cudaMemcpyDeviceToHost), "cudaMemcpy(found back)");
+    if (found) {
+      uint64_t solution = 0, found_index = 0;
+      uint8_t solution_hash[32];
+      check_cuda(cudaMemcpy(&solution, buffers->d_solution, sizeof(solution), cudaMemcpyDeviceToHost), "cudaMemcpy(solution)");
+      check_cuda(cudaMemcpy(&found_index, buffers->d_found_index, sizeof(found_index), cudaMemcpyDeviceToHost), "cudaMemcpy(found_index)");
+      check_cuda(cudaMemcpy(solution_hash, buffers->d_solution_hash, 32, cudaMemcpyDeviceToHost), "cudaMemcpy(solution_hash)");
+      total_hashes += found_index + 1ull;
+      printf("{\"type\":\"found\"");
+      print_id_field(task_id);
+      printf(",\"solution_nonce\":\"%" PRIu64 "\",\"hashes\":\"%" PRIu64 "\",\"digest\":\"", solution, total_hashes);
+      for (int i = 0; i < 32; ++i) printf("%02x", solution_hash[i]);
+      printf("\"}\n");
+      fflush(stdout);
+      return 0;
+    }
+
+    total_hashes += batch_size;
+    nonce += batch_size;
+    uint64_t now = now_ms();
+    if (progress_ms && now - last_progress >= progress_ms) {
+      printf("{\"type\":\"progress\"");
+      print_id_field(task_id);
+      printf(",\"hashes\":\"%" PRIu64 "\",\"nonce\":\"%" PRIu64 "\"}\n", total_hashes, nonce);
+      fflush(stdout);
+      last_progress = now;
+    }
+  }
+}
+
+int main(int argc, char **argv) {
   const char *prefix_hex = NULL;
   int difficulty = 0, device = 0;
   uint64_t start_nonce = 0, cutoff_ms = 0, progress_ms = 1000;
   uint64_t batch_size = 1073741824ull;
   uint64_t benchmark_ms = 0;
   int blocks = 0;
-  bool self_test = false;
+  bool self_test = false, worker_mode = false;
 
   for (int i = 1; i < argc; ++i) {
     if (!strcmp(argv[i], "--help") || !strcmp(argv[i], "-h")) { usage(stdout); return 0; }
     else if (!strcmp(argv[i], "--self-test")) self_test = true;
+    else if (!strcmp(argv[i], "--worker")) worker_mode = true;
     else if (!strcmp(argv[i], "--benchmark-ms") && i + 1 < argc) benchmark_ms = parse_u64(argv[++i]);
     else if (!strcmp(argv[i], "--prefix") && i + 1 < argc) prefix_hex = argv[++i];
     else if (!strcmp(argv[i], "--difficulty") && i + 1 < argc) difficulty = atoi(argv[++i]);
@@ -351,6 +517,11 @@ int main(int argc, char **argv) {
     else { usage(stderr); return 2; }
   }
 
+  if (worker_mode && (self_test || benchmark_ms || prefix_hex || difficulty || start_nonce || cutoff_ms)) {
+    usage(stderr);
+    return 2;
+  }
+
   if (self_test) {
     prefix_hex = "00";
     difficulty = 8;
@@ -359,16 +530,9 @@ int main(int argc, char **argv) {
     progress_ms = 0;
   }
 
-  if (!prefix_hex || parse_hex(prefix_hex, prefix, &prefix_len) || (!benchmark_ms && (difficulty <= 0 || difficulty > 256)) || batch_size == 0) {
+  if (!worker_mode && (!prefix_hex || (!benchmark_ms && (difficulty <= 0 || difficulty > 256)) || batch_size == 0)) {
     usage(stderr);
     return 2;
-  }
-
-  uint32_t base_words[16] = {0};
-  if (prefix_len + 8 <= 55) {
-    for (size_t i = 0; i < prefix_len; ++i) set_message_byte(base_words, i, prefix[i]);
-    set_message_byte(base_words, prefix_len + 8, 0x80);
-    base_words[15] = (uint32_t)((prefix_len + 8) * 8);
   }
 
   check_cuda(cudaSetDevice(device), "cudaSetDevice");
@@ -379,76 +543,45 @@ int main(int argc, char **argv) {
     fprintf(stderr, "bad CUDA block count\n");
     return 2;
   }
-  check_cuda(cudaMemcpyToSymbol(c_prefix, prefix, prefix_len), "cudaMemcpyToSymbol(prefix)");
-  check_cuda(cudaMemcpyToSymbol(c_prefix_len, &prefix_len, sizeof(prefix_len)), "cudaMemcpyToSymbol(prefix_len)");
-  check_cuda(cudaMemcpyToSymbol(c_base_words, base_words, sizeof(base_words)), "cudaMemcpyToSymbol(base_words)");
-  check_cuda(cudaMemcpyToSymbol(c_nonce_offset, &prefix_len, sizeof(prefix_len)), "cudaMemcpyToSymbol(nonce_offset)");
 
-  int *d_found = NULL;
-  uint64_t *d_solution = NULL, *d_found_index = NULL;
-  uint8_t *d_solution_hash = NULL;
-  uint64_t *d_sink = NULL;
-  check_cuda(cudaMalloc((void **)&d_found, sizeof(int)), "cudaMalloc(found)");
-  check_cuda(cudaMalloc((void **)&d_solution, sizeof(uint64_t)), "cudaMalloc(solution)");
-  check_cuda(cudaMalloc((void **)&d_found_index, sizeof(uint64_t)), "cudaMalloc(found_index)");
-  check_cuda(cudaMalloc((void **)&d_solution_hash, 32), "cudaMalloc(solution_hash)");
-  check_cuda(cudaMalloc((void **)&d_sink, (size_t)blocks * sizeof(uint64_t)), "cudaMalloc(sink)");
+  cuda_buffers buffers = {0};
+  alloc_buffers(&buffers, blocks);
 
-  uint64_t total_hashes = 0, nonce = start_nonce, last_progress = now_ms();
-  const int threads = 256;
   if (benchmark_ms) {
-    const uint64_t started = now_ms();
-    while (now_ms() - started < benchmark_ms) {
-      check_cuda(cudaMemset(d_sink, 0, (size_t)blocks * sizeof(uint64_t)), "cudaMemset(sink)");
-      benchmark_kernel<<<blocks, threads>>>(nonce, batch_size, d_sink);
-      check_cuda(cudaGetLastError(), "benchmark_kernel launch");
-      check_cuda(cudaDeviceSynchronize(), "benchmark_kernel");
-      nonce += batch_size;
-      total_hashes += batch_size;
-    }
-    const uint64_t elapsed = now_ms() - started;
-    double ghps = elapsed ? ((double)total_hashes / ((double)elapsed / 1000.0) / 1000000000.0) : 0.0;
-    printf("{\"type\":\"benchmark\",\"hashes\":\"%" PRIu64 "\",\"elapsed_ms\":\"%" PRIu64 "\",\"speed_ghs\":\"%.3f\"}\n", total_hashes, elapsed, ghps);
+    int rc = run_benchmark(&buffers, prefix_hex, batch_size, blocks, benchmark_ms);
+    free_buffers(&buffers);
+    return rc;
+  }
+
+  if (worker_mode) {
+    printf("{\"type\":\"ready\",\"device\":%d,\"blocks\":%d,\"batch_size\":\"%" PRIu64 "\"}\n", device, blocks, batch_size);
     fflush(stdout);
+    char line[4096];
+    while (fgets(line, sizeof(line), stdin)) {
+      if (strstr(line, "\"type\":\"shutdown\"")) break;
+      char task_id[128] = {0};
+      char task_prefix[256] = {0};
+      int task_difficulty = 0;
+      uint64_t task_start = 0, task_cutoff = 0;
+      json_get_string(line, "id", task_id, sizeof(task_id));
+      if (!json_get_string(line, "prefix", task_prefix, sizeof(task_prefix)) ||
+          !json_get_int(line, "difficulty", &task_difficulty) ||
+          task_difficulty <= 0 || task_difficulty > 256) {
+        printf("{\"type\":\"error\"");
+        print_id_field(task_id);
+        printf(",\"error\":\"bad task\"}\n");
+        fflush(stdout);
+        continue;
+      }
+      json_get_u64(line, "start", &task_start);
+      json_get_u64(line, "cutoff_ms", &task_cutoff);
+      run_mine_task(&buffers, task_id, task_prefix, task_difficulty, task_start, task_cutoff, progress_ms, batch_size, blocks);
+    }
+    free_buffers(&buffers);
     return 0;
   }
 
-  while (true) {
-    if (cutoff_ms && now_ms() >= cutoff_ms) {
-      printf("{\"type\":\"expired\",\"hashes\":\"%" PRIu64 "\"}\n", total_hashes);
-      fflush(stdout);
-      return 0;
-    }
-
-    int zero = 0;
-    check_cuda(cudaMemcpy(d_found, &zero, sizeof(zero), cudaMemcpyHostToDevice), "cudaMemcpy(found)");
-    mine_kernel<<<blocks, threads>>>(nonce, batch_size, difficulty, d_found, d_solution, d_found_index, d_solution_hash);
-    check_cuda(cudaGetLastError(), "mine_kernel launch");
-    check_cuda(cudaDeviceSynchronize(), "mine_kernel");
-
-    int found = 0;
-    check_cuda(cudaMemcpy(&found, d_found, sizeof(found), cudaMemcpyDeviceToHost), "cudaMemcpy(found back)");
-    if (found) {
-      uint64_t solution = 0, found_index = 0;
-      uint8_t solution_hash[32];
-      check_cuda(cudaMemcpy(&solution, d_solution, sizeof(solution), cudaMemcpyDeviceToHost), "cudaMemcpy(solution)");
-      check_cuda(cudaMemcpy(&found_index, d_found_index, sizeof(found_index), cudaMemcpyDeviceToHost), "cudaMemcpy(found_index)");
-      check_cuda(cudaMemcpy(solution_hash, d_solution_hash, 32, cudaMemcpyDeviceToHost), "cudaMemcpy(solution_hash)");
-      total_hashes += found_index + 1ull;
-      printf("{\"type\":\"found\",\"solution_nonce\":\"%" PRIu64 "\",\"hashes\":\"%" PRIu64 "\",\"digest\":\"", solution, total_hashes);
-      for (int i = 0; i < 32; ++i) printf("%02x", solution_hash[i]);
-      printf("\"}\n");
-      fflush(stdout);
-      return 0;
-    }
-
-    total_hashes += batch_size;
-    nonce += batch_size;
-    uint64_t now = now_ms();
-    if (progress_ms && now - last_progress >= progress_ms) {
-      printf("{\"type\":\"progress\",\"hashes\":\"%" PRIu64 "\",\"nonce\":\"%" PRIu64 "\"}\n", total_hashes, nonce);
-      fflush(stdout);
-      last_progress = now;
-    }
-  }
+  int rc = run_mine_task(&buffers, NULL, prefix_hex, difficulty, start_nonce, cutoff_ms, progress_ms, batch_size, blocks);
+  free_buffers(&buffers);
+  return rc;
 }
