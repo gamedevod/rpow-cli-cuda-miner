@@ -205,6 +205,18 @@ Watch logs:
 tail -f pool.log
 ```
 
+Stop behavior:
+
+- First `Ctrl+C` or `SIGTERM`: graceful stop. The pool stops accepting new challenges and finishes in-flight work.
+- Second `Ctrl+C`: force stop. CUDA worker processes are terminated immediately.
+
+Force stop from another shell:
+
+```bash
+pkill -f "node rpow-cli.js"
+pkill -f "rpow-cuda-miner"
+```
+
 `pool` runs continuously when `--count` is omitted. To stop after a target number of accepted mints:
 
 ```bash

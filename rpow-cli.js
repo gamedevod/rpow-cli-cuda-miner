@@ -1035,8 +1035,14 @@ class PersistentCudaMiner {
     });
   }
 
-  close() {
+  close(force = false) {
     this.closed = true;
+    if (force) {
+      try {
+        if (!this.child.killed) this.child.kill("SIGTERM");
+      } catch {}
+      return;
+    }
     try {
       if (!this.child.killed) this.child.stdin.write("{\"type\":\"shutdown\"}\n");
     } catch {}
@@ -1246,7 +1252,9 @@ async function main() {
     const poolStartedAt = Date.now();
     let lastStats = { at: poolStartedAt, requested: 0, solved: 0, accepted: 0 };
     let stopRequested = false;
+    let stopSignals = 0;
     let nextIndex = 0;
+    let cudaWorkers = [];
 
     function targetReached() {
       return target > 0 && summary.accepted >= target;
@@ -1257,13 +1265,22 @@ async function main() {
     }
 
     function requestStop(reason) {
+      stopSignals += 1;
+      if (stopSignals >= 2) {
+        log("warn", "pool force stopping", { reason });
+        challengeQueue.close();
+        solutionQueue.close();
+        for (const cudaWorker of cudaWorkers) cudaWorker.close(true);
+        process.exit(130);
+      }
       if (stopRequested) return;
       stopRequested = true;
-      log("warn", "pool stopping", { reason });
+      challengeQueue.close();
+      log("warn", "pool stopping", { reason, mode: "graceful", hint: "press Ctrl+C again to force exit" });
     }
 
-    process.once("SIGINT", () => requestStop("SIGINT"));
-    process.once("SIGTERM", () => requestStop("SIGTERM"));
+    process.on("SIGINT", () => requestStop("SIGINT"));
+    process.on("SIGTERM", () => requestStop("SIGTERM"));
 
     log("info", "pool start", {
       batch_id: batchId,
@@ -1331,7 +1348,7 @@ async function main() {
       }
     });
 
-    const cudaWorkers = Array.from({ length: solveWorkers }, (_, workerIndex) => new PersistentCudaMiner({
+    cudaWorkers = Array.from({ length: solveWorkers }, (_, workerIndex) => new PersistentCudaMiner({
       device: cudaDevices[workerIndex % cudaDevices.length],
       batchSize: cudaBatchSize,
       blocks: cudaBlocks,
