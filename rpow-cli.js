@@ -986,7 +986,7 @@ async function main() {
     const minerId = ensureMinerId(client, args["miner-id"]);
     const mintLogFile = path.resolve(process.cwd(), args["mint-log"] || DEFAULT_MINT_LOG);
     const cudaDevice = Number(args["cuda-device"] || 0);
-    const cudaBatchSize = args["cuda-batch-size"] || 67_108_864;
+    const cudaBatchSize = args["cuda-batch-size"] || 1_073_741_824;
     if (!Number.isInteger(workers) || workers < 1) throw new Error("--workers must be a positive integer");
     if (!["native", "node", "cuda"].includes(engine)) throw new Error("--engine must be native, node, or cuda");
     if (engine === "cuda" && (!Number.isInteger(cudaDevice) || cudaDevice < 0)) throw new Error("--cuda-device must be a non-negative integer");
@@ -1107,7 +1107,7 @@ Options:
   --workers ${defaultWorkerCount()}
   --engine native|node|cuda  (native C miner recommended; cuda for NVIDIA GPUs)
   --cuda-device 0
-  --cuda-batch-size 67108864
+  --cuda-batch-size 1073741824
   --verbose`);
 }
 

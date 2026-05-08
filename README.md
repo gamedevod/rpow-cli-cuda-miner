@@ -414,10 +414,10 @@ node rpow-cli.js mine --engine cuda --cuda-device 0
 
 ### `--cuda-batch-size`
 
-Number of nonces tested per CUDA kernel launch. Default: `67108864`.
+Number of nonces tested per CUDA kernel launch. Default: `1073741824`.
 
 ```powershell
-node rpow-cli.js mine --engine cuda --cuda-batch-size 67108864
+node rpow-cli.js mine --engine cuda --cuda-batch-size 1073741824
 ```
 
 ### `--fresh`

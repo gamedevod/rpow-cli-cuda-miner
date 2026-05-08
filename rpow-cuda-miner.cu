@@ -123,37 +123,11 @@ __device__ void nonce_le(uint64_t nonce, uint8_t out[8]) {
   }
 }
 
-__device__ void set_message_byte(uint32_t words[64], size_t pos, uint8_t value) {
+__device__ void set_message_byte(uint32_t words[16], size_t pos, uint8_t value) {
   words[pos >> 2] |= (uint32_t)value << (24 - (int)((pos & 3) * 8));
 }
 
-__device__ void sha256_oneblock(uint64_t nonce, uint8_t hash[32]) {
-  uint32_t a,b,c,d,e,f,g,h,t1,t2,m[64];
-  for (int i = 0; i < 64; ++i) m[i] = 0;
-
-  for (size_t i = 0; i < c_prefix_len; ++i) set_message_byte(m, i, c_prefix[i]);
-  for (int i = 0; i < 8; ++i) {
-    set_message_byte(m, c_prefix_len + (size_t)i, (uint8_t)(nonce & 0xffu));
-    nonce >>= 8;
-  }
-  const size_t message_len = c_prefix_len + 8;
-  set_message_byte(m, message_len, 0x80);
-  m[15] = (uint32_t)(message_len * 8);
-
-  for (int i = 16; i < 64; ++i) m[i] = SIG1(m[i-2]) + m[i-7] + SIG0(m[i-15]) + m[i-16];
-
-  a=0x6a09e667; b=0xbb67ae85; c=0x3c6ef372; d=0xa54ff53a;
-  e=0x510e527f; f=0x9b05688c; g=0x1f83d9ab; h=0x5be0cd19;
-  for (int i = 0; i < 64; ++i) {
-    t1 = h + EP1(e) + CH(e,f,g) + k[i] + m[i];
-    t2 = EP0(a) + MAJ(a,b,c);
-    h=g; g=f; f=e; e=d+t1; d=c; c=b; b=a; a=t1+t2;
-  }
-
-  uint32_t state[8] = {
-    0x6a09e667 + a, 0xbb67ae85 + b, 0x3c6ef372 + c, 0xa54ff53a + d,
-    0x510e527f + e, 0x9b05688c + f, 0x1f83d9ab + g, 0x5be0cd19 + h
-  };
+__device__ void digest_from_state(const uint32_t state[8], uint8_t hash[32]) {
   for (int i = 0; i < 4; ++i) {
     hash[i]      = (state[0] >> (24 - i * 8)) & 0xff;
     hash[i + 4]  = (state[1] >> (24 - i * 8)) & 0xff;
@@ -166,6 +140,52 @@ __device__ void sha256_oneblock(uint64_t nonce, uint8_t hash[32]) {
   }
 }
 
+__device__ bool state_has_trailing_zero_bits(const uint32_t state[8], int difficulty) {
+  int remaining = difficulty;
+  for (int i = 7; i >= 0 && remaining > 0; --i) {
+    if (remaining >= 32) {
+      if (state[i] != 0) return false;
+      remaining -= 32;
+      continue;
+    }
+    uint32_t mask = (1u << remaining) - 1u;
+    return (state[i] & mask) == 0;
+  }
+  return true;
+}
+
+__device__ void sha256_oneblock_state(uint64_t nonce, uint32_t state[8]) {
+  uint32_t a,b,c,d,e,f,g,h,t1,t2,w[16];
+  for (int i = 0; i < 16; ++i) w[i] = 0;
+
+  for (size_t i = 0; i < c_prefix_len; ++i) set_message_byte(w, i, c_prefix[i]);
+  for (int i = 0; i < 8; ++i) {
+    set_message_byte(w, c_prefix_len + (size_t)i, (uint8_t)(nonce & 0xffu));
+    nonce >>= 8;
+  }
+  const size_t message_len = c_prefix_len + 8;
+  set_message_byte(w, message_len, 0x80);
+  w[15] = (uint32_t)(message_len * 8);
+
+  a=0x6a09e667; b=0xbb67ae85; c=0x3c6ef372; d=0xa54ff53a;
+  e=0x510e527f; f=0x9b05688c; g=0x1f83d9ab; h=0x5be0cd19;
+  for (int i = 0; i < 64; ++i) {
+    uint32_t wi;
+    if (i < 16) {
+      wi = w[i];
+    } else {
+      wi = SIG1(w[(i - 2) & 15]) + w[(i - 7) & 15] + SIG0(w[(i - 15) & 15]) + w[i & 15];
+      w[i & 15] = wi;
+    }
+    t1 = h + EP1(e) + CH(e,f,g) + k[i] + wi;
+    t2 = EP0(a) + MAJ(a,b,c);
+    h=g; g=f; f=e; e=d+t1; d=c; c=b; b=a; a=t1+t2;
+  }
+
+  state[0]=0x6a09e667 + a; state[1]=0xbb67ae85 + b; state[2]=0x3c6ef372 + c; state[3]=0xa54ff53a + d;
+  state[4]=0x510e527f + e; state[5]=0x9b05688c + f; state[6]=0x1f83d9ab + g; state[7]=0x5be0cd19 + h;
+}
+
 __global__ void mine_kernel(uint64_t start_nonce, uint64_t batch_size, int difficulty, int *found,
                             uint64_t *solution, uint64_t *found_index, uint8_t *solution_hash) {
   uint64_t idx = (uint64_t)blockIdx.x * (uint64_t)blockDim.x + (uint64_t)threadIdx.x;
@@ -173,9 +193,13 @@ __global__ void mine_kernel(uint64_t start_nonce, uint64_t batch_size, int diffi
 
   uint64_t nonce = start_nonce + idx;
   uint8_t hash[32];
+  bool ok = false;
 
   if (c_prefix_len + 8 <= 55) {
-    sha256_oneblock(nonce, hash);
+    uint32_t state[8];
+    sha256_oneblock_state(nonce, state);
+    ok = state_has_trailing_zero_bits(state, difficulty);
+    if (ok) digest_from_state(state, hash);
   } else {
     uint8_t nonce_bytes[8];
     nonce_le(nonce, nonce_bytes);
@@ -184,9 +208,10 @@ __global__ void mine_kernel(uint64_t start_nonce, uint64_t batch_size, int diffi
     sha256_update(&ctx, c_prefix, c_prefix_len);
     sha256_update(&ctx, nonce_bytes, 8);
     sha256_final(&ctx, hash);
+    ok = trailing_zero_bits(hash) >= difficulty;
   }
 
-  if (trailing_zero_bits(hash) >= difficulty) {
+  if (ok) {
     if (atomicCAS(found, 0, 1) == 0) {
       *solution = nonce;
       *found_index = idx;
@@ -244,7 +269,7 @@ int main(int argc, char **argv) {
   const char *prefix_hex = NULL;
   int difficulty = 0, device = 0;
   uint64_t start_nonce = 0, cutoff_ms = 0, progress_ms = 1000;
-  uint64_t batch_size = 67108864ull;
+  uint64_t batch_size = 1073741824ull;
   bool self_test = false;
 
   for (int i = 1; i < argc; ++i) {
