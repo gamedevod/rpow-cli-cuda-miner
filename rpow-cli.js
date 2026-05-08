@@ -754,7 +754,7 @@ function mineSolutionNative(challenge, state, stateFile, logEveryMs, workerCount
             workers: workerCount,
             engine: "native",
           };
-          saveState(stateFile, state);
+          if (stateFile) saveState(stateFile, state);
           resolve({
             solution_nonce: message.solution_nonce,
             hashes: message.hashes,
@@ -843,7 +843,7 @@ function mineSolutionCuda(challenge, state, stateFile, logEveryMs, options) {
             cuda_batch_size: batchSize,
             cuda_blocks: blocks || "auto",
           };
-          saveState(stateFile, state);
+          if (stateFile) saveState(stateFile, state);
           log("info", "mining", {
             hashes: hashes.toString(),
             nonce: message.nonce,
