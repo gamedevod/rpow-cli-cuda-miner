@@ -222,12 +222,8 @@ node rpow-cli.js pool \
   --mint-workers 300 \
   --cuda-blocks 32768 \
   --cuda-batch-size 1073741824 \
-  --timeout 60000 \
-  --retry-delay-ms 2000 \
-  --pool-request-retries 2 \
-  --api-backoff-ms 2000 \
-  --api-backoff-max-ms 30000 \
-  --mint-requeue-attempts 20 \
+  --pool-timeout 0 \
+  --api-retry-delay-ms 500 \
   --stats-every-ms 5000 \
   --miner-id pool-8x5090 \
   --cookie-file .rpow-cookies.txt > pool.log 2>&1 &
@@ -279,6 +275,7 @@ This avoids CUDA process/context startup overhead for every token.
 ```text
 requested
 request_failed
+request_retried
 solved
 accepted
 accepted_per_min
@@ -286,14 +283,12 @@ recent_accepted_per_min
 recent_requested_per_min
 recent_solved_per_min
 mint_failed
-mint_requeued
+mint_retried
 solve_failed
 challenge_queue
 solution_queue
 active_solves
 active_mints
-challenge_cooldown_ms
-mint_cooldown_ms
 failures
 ```
 
@@ -303,7 +298,7 @@ Read the bottleneck from these counters:
 - `challenge_queue` near zero and GPUs idle: not enough challenge prefetch or API request latency.
 - `solution_queue` growing: mint workers/API are slower than solvers.
 - Many `429`, `502`, or `5xx`: reduce API parallelism.
-- `mint_requeued` growing: solved mints are being preserved and retried after temporary API pressure.
+- `request_retried` or `mint_retried` growing: individual workers are retrying failed API requests every `--api-retry-delay-ms`.
 - Many `expired`: challenge buffer is too large or mint latency is too high.
 
 ## Tuning
@@ -317,14 +312,16 @@ Aggressive 8x RTX 5090 starting point:
 If API errors increase:
 
 ```bash
---challenge-buffer 100 --prefetch-workers 100 --mint-workers 100 --api-backoff-ms 5000
+--challenge-buffer 100 --prefetch-workers 100 --mint-workers 100 --api-retry-delay-ms 500
 ```
 
-If the backend returns many `503` responses, keep pool-level retries short and let the shared cooldown/requeue system handle recovery:
+Pool API retry model:
 
 ```bash
---pool-request-retries 1 --api-backoff-ms 5000 --api-backoff-max-ms 60000 --mint-requeue-attempts 50
+--pool-timeout 0 --api-retry-delay-ms 500
 ```
+
+`--pool-timeout 0` disables the CLI abort timeout for pool requests. Each worker retries its own failed `/challenge` or `/mint` request forever with the configured delay until it gets a successful response or the pool is stopped.
 
 If GPUs are idle and API is healthy:
 
