@@ -94,6 +94,36 @@ NVIDIA GeForce RTX 5090, 12.0
 
 If `nvcc` is missing or too old, install CUDA Toolkit 12.8+ or CUDA 13.x first. Do not install drivers/toolkits blindly on a rented server without checking the provider image.
 
+## Optional Proxy Support
+
+Without a proxy the CLI uses Node.js built-in `fetch`.
+
+When a proxy is active, the CLI uses `undici.fetch` from the npm `undici` package together with `undici.ProxyAgent`. This avoids Node.js 24 failures such as `UND_ERR_INVALID_ARG` that can happen when a dispatcher from one Undici version is passed into Node's built-in fetch implementation.
+
+Install `undici` if you need proxy mode:
+
+```bash
+npm install undici
+```
+
+The repo also includes `package.json`, so plain `npm install` is enough.
+
+Use a proxy explicitly:
+
+```bash
+node rpow-cli.js me \
+  --proxy http://127.0.0.1:8080 \
+  --cookie-file .rpow-cookies.txt
+```
+
+Environment variables are also supported:
+
+```bash
+export HTTPS_PROXY=http://127.0.0.1:8080
+export NO_PROXY=localhost,127.0.0.1
+node rpow-cli.js me --cookie-file .rpow-cookies.txt
+```
+
 ## Build CUDA Miner
 
 ```bash
@@ -422,6 +452,15 @@ Install CUDA Toolkit 12.8+ or CUDA 13.x on the server, then rebuild:
 
 ```bash
 ./build-cuda.sh
+```
+
+### `UND_ERR_INVALID_ARG` with proxy on Node.js 24
+
+Install `undici` and run with `--proxy` or `HTTPS_PROXY`. In proxy mode the CLI uses `undici.fetch`, not global `fetch`:
+
+```bash
+npm install undici
+node rpow-cli.js me --proxy http://127.0.0.1:8080 --cookie-file .rpow-cookies.txt
 ```
 
 ### Low token rate with high raw GH/s

@@ -33,6 +33,7 @@ const CUDA_MINER_CANDIDATES = process.platform === "win32"
     path.join(__dirname, "rpow-cuda-miner"),
     path.join(__dirname, "rpow-cuda-miner.exe"),
   ];
+const LOOPBACK_HOSTS = new Set(["localhost", "127.0.0.1", "::1"]);
 const SAFE_HOSTS = new Set([
   "api.rpow2.com",
   "rpow2.com",
@@ -128,6 +129,49 @@ function looksLikeProviderRateLimit(err) {
 
 function errorCode(err) {
   return err?.code || err?.cause?.code || err?.cause?.cause?.code;
+}
+
+function proxyEnv() {
+  return process.env.HTTPS_PROXY
+    || process.env.https_proxy
+    || process.env.HTTP_PROXY
+    || process.env.http_proxy
+    || "";
+}
+
+function shouldBypassProxy(url, noProxyValue) {
+  if (!noProxyValue) return false;
+  const host = url.hostname.toLowerCase();
+  if (LOOPBACK_HOSTS.has(host)) return true;
+  return String(noProxyValue)
+    .split(",")
+    .map((item) => item.trim().toLowerCase())
+    .filter(Boolean)
+    .some((rule) => {
+      if (rule === "*") return true;
+      const normalized = rule.startsWith(".") ? rule.slice(1) : rule;
+      return host === normalized || host.endsWith(`.${normalized}`);
+    });
+}
+
+function createFetchRuntime(proxyUrl) {
+  if (!proxyUrl) return { fetchImpl: globalThis.fetch, dispatcher: null, proxy: null };
+  if (proxyUrl === true || typeof proxyUrl !== "string") {
+    throw new Error("--proxy requires a proxy URL, for example: --proxy http://127.0.0.1:8080");
+  }
+  let undici;
+  try {
+    undici = require("undici");
+  } catch (err) {
+    const e = new Error("proxy requires npm package undici; install it with: npm install undici");
+    e.cause = err;
+    throw e;
+  }
+  if (typeof undici.fetch !== "function" || typeof undici.ProxyAgent !== "function") {
+    throw new Error("installed undici package does not expose fetch and ProxyAgent");
+  }
+  const dispatcher = new undici.ProxyAgent(proxyUrl);
+  return { fetchImpl: undici.fetch, dispatcher, proxy: proxyUrl };
 }
 
 function isTransientNetworkError(err) {
@@ -303,6 +347,12 @@ class RpowClient {
     this.timeoutMs = Number(options.timeoutMs || 20000);
     this.maxRetries = Number(options.retries || 5);
     this.retryDelayMs = Number(options.retryDelayMs || 2000);
+    this.noProxy = options.noProxy || process.env.NO_PROXY || process.env.no_proxy || "";
+    const proxyUrl = options.proxy || proxyEnv();
+    const runtime = createFetchRuntime(proxyUrl);
+    this.fetchImpl = runtime.fetchImpl;
+    this.dispatcher = runtime.dispatcher;
+    this.proxy = runtime.proxy;
   }
 
   save() {
@@ -332,19 +382,22 @@ class RpowClient {
           headers["content-type"] = "application/json";
           payload = JSON.stringify(body);
         }
+        const useProxy = this.dispatcher && !shouldBypassProxy(url, this.noProxy);
         debugLog("HTTP ->", {
           method,
           url: safeUrlForLog(url),
           attempt,
           has_body: body !== undefined,
           has_cookie: Boolean(headers.cookie),
+          proxy: Boolean(useProxy),
         });
-        const res = await fetch(url, {
+        const res = await this.fetchImpl(url, {
           method,
           headers,
           body: payload,
           redirect: options.redirect || "manual",
           signal: controller.signal,
+          ...(useProxy ? { dispatcher: this.dispatcher } : {}),
         });
         storeSetCookies(this.state, responseSetCookies(res.headers));
         this.save();
@@ -1146,6 +1199,8 @@ async function main() {
     timeoutMs: args.timeout || 20000,
     retries: args.retries || 5,
     retryDelayMs: args["retry-delay-ms"] || 2000,
+    proxy: args.proxy,
+    noProxy: args["no-proxy"],
   });
 
   if (args["cookie-file"]) importCookieFile(client, args["cookie-file"]);
@@ -1738,6 +1793,8 @@ Options:
   --timeout 20000
   --retries 5
   --retry-delay-ms 2000
+  --proxy http://127.0.0.1:8080
+  --no-proxy localhost,127.0.0.1
   --log-every-ms 5000
   --workers ${defaultWorkerCount()}
   --engine native|node|cuda  (native C miner recommended; cuda for NVIDIA GPUs)
