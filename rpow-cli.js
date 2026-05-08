@@ -943,6 +943,32 @@ function createLimiter(concurrency) {
   });
 }
 
+class AsyncQueue {
+  constructor() {
+    this.items = [];
+    this.waiters = [];
+    this.closed = false;
+  }
+
+  push(item) {
+    if (this.closed) throw new Error("queue is closed");
+    const waiter = this.waiters.shift();
+    if (waiter) waiter({ done: false, value: item });
+    else this.items.push(item);
+  }
+
+  close() {
+    this.closed = true;
+    while (this.waiters.length) this.waiters.shift()({ done: true });
+  }
+
+  async shift() {
+    if (this.items.length) return { done: false, value: this.items.shift() };
+    if (this.closed) return { done: true };
+    return new Promise((resolve) => this.waiters.push(resolve));
+  }
+}
+
 function parseIntegerList(value) {
   return String(value)
     .split(",")
@@ -1052,7 +1078,6 @@ async function main() {
 
     const account = await client.api("GET", "/me");
     const batchId = crypto.randomUUID();
-    const challenges = [];
     const summary = { requested: 0, request_failed: 0, solved: 0, accepted: 0, mint_failed: 0, solve_failed: 0 };
     const failures = {};
     log("info", "pool-test start", {
@@ -1068,8 +1093,10 @@ async function main() {
       miner_id: minerId,
     });
 
+    const challengeQueue = new AsyncQueue();
+    const solutionQueue = new AsyncQueue();
     const indices = Array.from({ length: total }, (_, i) => i);
-    const fetched = await mapConcurrent(indices, prefetchWorkers, async (i) => {
+    const fetchPromise = mapConcurrent(indices, prefetchWorkers, async (i) => {
       try {
         const challenge = await client.api("POST", "/challenge");
         summary.requested += 1;
@@ -1080,89 +1107,99 @@ async function main() {
           difficulty: `${challenge.difficulty_bits} bits`,
           expires: challenge.expires_at,
         });
-        return challenge;
+        challengeQueue.push({ challenge, index: i });
       } catch (err) {
         summary.request_failed += 1;
         const key = err.code || String(err.status || "REQUEST_FAILED");
         failures[key] = (failures[key] || 0) + 1;
         log("warn", "pool-test challenge failed", { index: i + 1, total, error: err.message, code: err.code, status: err.status });
-        return null;
+      }
+    }).finally(() => challengeQueue.close());
+
+    const solveTasks = Array.from({ length: solveWorkers }, async (_, workerIndex) => {
+      const solveDevice = cudaDevices[workerIndex % cudaDevices.length];
+      while (true) {
+        const item = await challengeQueue.shift();
+        if (item.done) return;
+        const { challenge, index } = item.value;
+        const solveState = {
+          mining: { challenge_id: challenge.challenge_id, nonce: "0", hashes: "0", difficulty_bits: challenge.difficulty_bits, engine: "cuda" },
+        };
+        try {
+          log("info", "pool-test solve", { index: index + 1, total, id: challenge.challenge_id, cuda_device: solveDevice });
+          const solution = await mineSolutionCuda(challenge, solveState, null, logEveryMs, {
+            device: solveDevice,
+            batchSize: cudaBatchSize,
+            blocks: cudaBlocks,
+          });
+          summary.solved += 1;
+          log("info", "pool-test solved", {
+            index: index + 1,
+            total,
+            id: challenge.challenge_id,
+            cuda_device: solveDevice,
+            nonce: solution.solution_nonce,
+            hashes: solution.hashes,
+            speed: solution.speed,
+          });
+          solutionQueue.push({ challenge, solution, index, solveDevice });
+        } catch (err) {
+          summary.solve_failed += 1;
+          const key = err.code || String(err.status || "SOLVE_FAILED");
+          failures[key] = (failures[key] || 0) + 1;
+          log("warn", "pool-test solve failed", { id: challenge.challenge_id, cuda_device: solveDevice, error: err.message, code: err.code, status: err.status });
+        }
       }
     });
-    challenges.push(...fetched.filter(Boolean));
 
-    const mintLimit = createLimiter(mintWorkers);
-    const mintPromises = [];
-
-    await mapConcurrent(challenges, solveWorkers, async (challenge, i) => {
-      const solveDevice = cudaDevices[i % cudaDevices.length];
-      const solveState = {
-        mining: { challenge_id: challenge.challenge_id, nonce: "0", hashes: "0", difficulty_bits: challenge.difficulty_bits, engine: "cuda" },
-      };
-      try {
-        log("info", "pool-test solve", { index: i + 1, total: challenges.length, id: challenge.challenge_id, cuda_device: solveDevice });
-        const solution = await mineSolutionCuda(challenge, solveState, null, logEveryMs, {
-          device: solveDevice,
-          batchSize: cudaBatchSize,
-          blocks: cudaBlocks,
-        });
-        summary.solved += 1;
-        log("info", "pool-test solved", {
-          index: i + 1,
-          total: challenges.length,
-          id: challenge.challenge_id,
-          cuda_device: solveDevice,
-          nonce: solution.solution_nonce,
-          hashes: solution.hashes,
-          speed: solution.speed,
-        });
-        const mintPromise = mintLimit(async () => {
-          try {
-            log("info", "pool-test mint", { index: i + 1, total: challenges.length, id: challenge.challenge_id });
-            const result = await client.api("POST", "/mint", {
-              challenge_id: challenge.challenge_id,
-              solution_nonce: solution.solution_nonce,
-            });
-            summary.accepted += 1;
-            const receipt = buildMintReceipt({
-              minerId,
-              account,
-              challenge,
-              solution,
-              result,
-              engine,
-              workers: 0,
-              engineOptions: {
-                pool_test: true,
-                batch_id: batchId,
-                cuda_device: solveDevice,
-                cuda_batch_size: String(cudaBatchSize),
-                cuda_blocks: cudaBlocks ? String(cudaBlocks) : "auto",
-              },
-            });
-            appendJsonLine(mintLogFile, receipt);
-            log("success", "pool-test mint accepted", {
-              token_id: receipt.token?.id,
-              challenge_id: receipt.challenge_id,
-              solution_nonce: receipt.solution_nonce,
-              receipt_hash: receipt.receipt_hash,
-            });
-          } catch (err) {
-            summary.mint_failed += 1;
-            const key = err.code || String(err.status || "MINT_FAILED");
-            failures[key] = (failures[key] || 0) + 1;
-            log("warn", "pool-test mint failed", { id: challenge.challenge_id, error: err.message, code: err.code, status: err.status });
-          }
-        });
-        mintPromises.push(mintPromise);
-      } catch (err) {
-        summary.solve_failed += 1;
-        const key = err.code || String(err.status || "SOLVE_FAILED");
-        failures[key] = (failures[key] || 0) + 1;
-        log("warn", "pool-test solve failed", { id: challenge.challenge_id, cuda_device: solveDevice, error: err.message, code: err.code, status: err.status });
+    const mintTasks = Array.from({ length: mintWorkers }, async () => {
+      while (true) {
+        const item = await solutionQueue.shift();
+        if (item.done) return;
+        const { challenge, solution, index, solveDevice } = item.value;
+        try {
+          log("info", "pool-test mint", { index: index + 1, total, id: challenge.challenge_id });
+          const result = await client.api("POST", "/mint", {
+            challenge_id: challenge.challenge_id,
+            solution_nonce: solution.solution_nonce,
+          });
+          summary.accepted += 1;
+          const receipt = buildMintReceipt({
+            minerId,
+            account,
+            challenge,
+            solution,
+            result,
+            engine,
+            workers: 0,
+            engineOptions: {
+              pool_test: true,
+              batch_id: batchId,
+              cuda_device: solveDevice,
+              cuda_batch_size: String(cudaBatchSize),
+              cuda_blocks: cudaBlocks ? String(cudaBlocks) : "auto",
+            },
+          });
+          appendJsonLine(mintLogFile, receipt);
+          log("success", "pool-test mint accepted", {
+            token_id: receipt.token?.id,
+            challenge_id: receipt.challenge_id,
+            solution_nonce: receipt.solution_nonce,
+            receipt_hash: receipt.receipt_hash,
+          });
+        } catch (err) {
+          summary.mint_failed += 1;
+          const key = err.code || String(err.status || "MINT_FAILED");
+          failures[key] = (failures[key] || 0) + 1;
+          log("warn", "pool-test mint failed", { id: challenge.challenge_id, error: err.message, code: err.code, status: err.status });
+        }
       }
     });
-    await Promise.all(mintPromises);
+
+    await fetchPromise;
+    await Promise.all(solveTasks);
+    solutionQueue.close();
+    await Promise.all(mintTasks);
 
     client.state.challenge = null;
     client.state.mining = null;
