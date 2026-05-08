@@ -241,7 +241,7 @@ node rpow-cli.js mine --count 1 --engine cuda --cuda-device 0 --cookie-file .rpo
 Test whether the backend accepts a pre-fetched pool of challenges. This requests all challenges first, solves them on CUDA, then submits all solutions:
 
 ```bash
-node rpow-cli.js pool-test --challenges 10 --prefetch-workers 10 --mint-workers 10 --engine cuda --cuda-device 0 --cuda-blocks 32768 --cuda-batch-size 1073741824 --timeout 60000 --retry-delay-ms 2000 --cookie-file .rpow-cookies.txt
+node rpow-cli.js pool-test --challenges 10 --prefetch-workers 10 --solve-workers 8 --mint-workers 10 --engine cuda --cuda-devices 0,1,2,3,4,5,6,7 --cuda-blocks 32768 --cuda-batch-size 1073741824 --timeout 60000 --retry-delay-ms 2000 --cookie-file .rpow-cookies.txt
 ```
 
 Use the final `pool-test complete` line to decide whether larger local pooling is viable. If most mints return `already claimed`, `invalid`, or `expired`, the backend does not support a large prefetch pool for one account.
