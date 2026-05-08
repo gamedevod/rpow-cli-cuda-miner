@@ -18,6 +18,8 @@ typedef struct {
 
 __constant__ uint8_t c_prefix[64];
 __constant__ size_t c_prefix_len;
+__constant__ uint32_t c_base_words[16];
+__constant__ size_t c_nonce_offset;
 
 __constant__ uint32_t k[64] = {
   0x428a2f98,0x71374491,0xb5c0fbcf,0xe9b5dba5,0x3956c25b,0x59f111f1,0x923f82a4,0xab1c5ed5,
@@ -38,7 +40,7 @@ __constant__ uint32_t k[64] = {
 #define SIG0(x) (ROTR(x,7) ^ ROTR(x,18) ^ ((x) >> 3))
 #define SIG1(x) (ROTR(x,17) ^ ROTR(x,19) ^ ((x) >> 10))
 
-__device__ void sha256_transform(sha256_ctx *ctx, const uint8_t data[]) {
+__device__ __forceinline__ void sha256_transform(sha256_ctx *ctx, const uint8_t data[]) {
   uint32_t a,b,c,d,e,f,g,h,i,j,t1,t2,m[64];
   for (i = 0, j = 0; i < 16; ++i, j += 4)
     m[i] = ((uint32_t)data[j] << 24) | ((uint32_t)data[j+1] << 16) | ((uint32_t)data[j+2] << 8) | data[j+3];
@@ -54,13 +56,13 @@ __device__ void sha256_transform(sha256_ctx *ctx, const uint8_t data[]) {
   ctx->state[4]+=e; ctx->state[5]+=f; ctx->state[6]+=g; ctx->state[7]+=h;
 }
 
-__device__ void sha256_init(sha256_ctx *ctx) {
+__device__ __forceinline__ void sha256_init(sha256_ctx *ctx) {
   ctx->datalen = 0; ctx->bitlen = 0;
   ctx->state[0]=0x6a09e667; ctx->state[1]=0xbb67ae85; ctx->state[2]=0x3c6ef372; ctx->state[3]=0xa54ff53a;
   ctx->state[4]=0x510e527f; ctx->state[5]=0x9b05688c; ctx->state[6]=0x1f83d9ab; ctx->state[7]=0x5be0cd19;
 }
 
-__device__ void sha256_update(sha256_ctx *ctx, const uint8_t data[], size_t len) {
+__device__ __forceinline__ void sha256_update(sha256_ctx *ctx, const uint8_t data[], size_t len) {
   for (size_t i = 0; i < len; ++i) {
     ctx->data[ctx->datalen++] = data[i];
     if (ctx->datalen == 64) {
@@ -71,7 +73,7 @@ __device__ void sha256_update(sha256_ctx *ctx, const uint8_t data[], size_t len)
   }
 }
 
-__device__ void sha256_final(sha256_ctx *ctx, uint8_t hash[]) {
+__device__ __forceinline__ void sha256_final(sha256_ctx *ctx, uint8_t hash[]) {
   uint32_t i = ctx->datalen;
   ctx->data[i++] = 0x80;
   if (ctx->datalen < 56) {
@@ -103,7 +105,7 @@ __device__ void sha256_final(sha256_ctx *ctx, uint8_t hash[]) {
   }
 }
 
-__device__ int trailing_zero_bits(const uint8_t hash[32]) {
+__device__ __forceinline__ int trailing_zero_bits(const uint8_t hash[32]) {
   int bits = 0;
   for (int i = 31; i >= 0; --i) {
     uint8_t b = hash[i];
@@ -116,18 +118,18 @@ __device__ int trailing_zero_bits(const uint8_t hash[32]) {
   return bits;
 }
 
-__device__ void nonce_le(uint64_t nonce, uint8_t out[8]) {
+__device__ __forceinline__ void nonce_le(uint64_t nonce, uint8_t out[8]) {
   for (int i = 0; i < 8; ++i) {
     out[i] = (uint8_t)(nonce & 0xffu);
     nonce >>= 8;
   }
 }
 
-__device__ void set_message_byte(uint32_t words[16], size_t pos, uint8_t value) {
+__host__ __device__ __forceinline__ void set_message_byte(uint32_t words[16], size_t pos, uint8_t value) {
   words[pos >> 2] |= (uint32_t)value << (24 - (int)((pos & 3) * 8));
 }
 
-__device__ void digest_from_state(const uint32_t state[8], uint8_t hash[32]) {
+__device__ __forceinline__ void digest_from_state(const uint32_t state[8], uint8_t hash[32]) {
   for (int i = 0; i < 4; ++i) {
     hash[i]      = (state[0] >> (24 - i * 8)) & 0xff;
     hash[i + 4]  = (state[1] >> (24 - i * 8)) & 0xff;
@@ -140,7 +142,7 @@ __device__ void digest_from_state(const uint32_t state[8], uint8_t hash[32]) {
   }
 }
 
-__device__ bool state_has_trailing_zero_bits(const uint32_t state[8], int difficulty) {
+__device__ __forceinline__ bool state_has_trailing_zero_bits(const uint32_t state[8], int difficulty) {
   int remaining = difficulty;
   for (int i = 7; i >= 0 && remaining > 0; --i) {
     if (remaining >= 32) {
@@ -154,21 +156,21 @@ __device__ bool state_has_trailing_zero_bits(const uint32_t state[8], int diffic
   return true;
 }
 
-__device__ void sha256_oneblock_state(uint64_t nonce, uint32_t state[8]) {
+__device__ __forceinline__ void sha256_oneblock_state(uint64_t nonce, uint32_t state[8]) {
   uint32_t a,b,c,d,e,f,g,h,t1,t2,w[16];
-  for (int i = 0; i < 16; ++i) w[i] = 0;
+  #pragma unroll
+  for (int i = 0; i < 16; ++i) w[i] = c_base_words[i];
 
-  for (size_t i = 0; i < c_prefix_len; ++i) set_message_byte(w, i, c_prefix[i]);
+  size_t off = c_nonce_offset;
+  #pragma unroll
   for (int i = 0; i < 8; ++i) {
-    set_message_byte(w, c_prefix_len + (size_t)i, (uint8_t)(nonce & 0xffu));
+    set_message_byte(w, off + (size_t)i, (uint8_t)(nonce & 0xffu));
     nonce >>= 8;
   }
-  const size_t message_len = c_prefix_len + 8;
-  set_message_byte(w, message_len, 0x80);
-  w[15] = (uint32_t)(message_len * 8);
 
   a=0x6a09e667; b=0xbb67ae85; c=0x3c6ef372; d=0xa54ff53a;
   e=0x510e527f; f=0x9b05688c; g=0x1f83d9ab; h=0x5be0cd19;
+  #pragma unroll 64
   for (int i = 0; i < 64; ++i) {
     uint32_t wi;
     if (i < 16) {
@@ -303,6 +305,13 @@ int main(int argc, char **argv) {
     return 2;
   }
 
+  uint32_t base_words[16] = {0};
+  if (prefix_len + 8 <= 55) {
+    for (size_t i = 0; i < prefix_len; ++i) set_message_byte(base_words, i, prefix[i]);
+    set_message_byte(base_words, prefix_len + 8, 0x80);
+    base_words[15] = (uint32_t)((prefix_len + 8) * 8);
+  }
+
   check_cuda(cudaSetDevice(device), "cudaSetDevice");
   cudaDeviceProp props;
   check_cuda(cudaGetDeviceProperties(&props, device), "cudaGetDeviceProperties");
@@ -313,6 +322,8 @@ int main(int argc, char **argv) {
   }
   check_cuda(cudaMemcpyToSymbol(c_prefix, prefix, prefix_len), "cudaMemcpyToSymbol(prefix)");
   check_cuda(cudaMemcpyToSymbol(c_prefix_len, &prefix_len, sizeof(prefix_len)), "cudaMemcpyToSymbol(prefix_len)");
+  check_cuda(cudaMemcpyToSymbol(c_base_words, base_words, sizeof(base_words)), "cudaMemcpyToSymbol(base_words)");
+  check_cuda(cudaMemcpyToSymbol(c_nonce_offset, &prefix_len, sizeof(prefix_len)), "cudaMemcpyToSymbol(nonce_offset)");
 
   int *d_found = NULL;
   uint64_t *d_solution = NULL, *d_found_index = NULL;
