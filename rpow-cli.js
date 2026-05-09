@@ -1023,6 +1023,10 @@ function mineSolutionCuda(challenge, state, stateFile, logEveryMs, options) {
   });
 }
 
+function isBenignStreamCloseError(err) {
+  return ["EPIPE", "ERR_STREAM_DESTROYED", "ERR_STREAM_WRITE_AFTER_END"].includes(err?.code);
+}
+
 class PersistentCudaMiner {
   constructor(options) {
     const cudaMiner = cudaMinerPath();
@@ -1049,6 +1053,10 @@ class PersistentCudaMiner {
     this.child.stderr.on("data", (chunk) => {
       this.stderr += chunk.toString("utf8");
       if (this.stderr.length > 8192) this.stderr = this.stderr.slice(-8192);
+    });
+    this.child.stdin.on("error", (err) => {
+      if (this.closed && isBenignStreamCloseError(err)) return;
+      this.failCurrent(err);
     });
     this.child.on("error", (err) => this.failCurrent(err));
     this.child.on("exit", (code) => {
@@ -1160,6 +1168,7 @@ class PersistentCudaMiner {
   }
 
   close(force = false) {
+    if (this.closed && !force) return;
     this.closed = true;
     if (force) {
       try {
@@ -1168,10 +1177,14 @@ class PersistentCudaMiner {
       return;
     }
     try {
-      if (!this.child.killed) this.child.stdin.write("{\"type\":\"shutdown\"}\n");
+      if (!this.child.killed && !this.child.stdin.destroyed && !this.child.stdin.writableEnded) {
+        this.child.stdin.write("{\"type\":\"shutdown\"}\n", (err) => {
+          if (err && !isBenignStreamCloseError(err)) this.failCurrent(err);
+        });
+      }
     } catch {}
     try {
-      if (!this.child.killed) this.child.stdin.end();
+      if (!this.child.killed && !this.child.stdin.destroyed && !this.child.stdin.writableEnded) this.child.stdin.end();
     } catch {}
   }
 }
